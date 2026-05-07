@@ -699,8 +699,8 @@ class NoteRequest(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-@app.get("/")
-def root():
+@app.get("/api/health")
+def health():
     return {"status": "ok", "service": "PaperTrail API", "version": "2.0.0"}
 
 
