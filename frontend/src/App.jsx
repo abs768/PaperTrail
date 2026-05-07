@@ -449,7 +449,7 @@ export default function PaperTrail() {
       const res=await fetch(`${API_BASE}/query`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:q})});
       const data=await res.json();
       if(!res.ok) setChat(p=>[...p,{role:"assistant",text:res.status===429?"Rate limited — wait a moment and retry.":(data.detail||"Query failed."),isError:true}]);
-      else setChat(p=>[...p,{role:"assistant",text:data.answer,sources:data.sources||[],confidence:data.confidence,followUp:data.follow_up_questions||[]}]);
+      else setChat(p=>[...p,{role:"assistant",text:data.answer,sources:data.sources||[],confidence:data.confidence,followUp:data.follow_up_questions||[],unsupported:data.unsupported_claims||[]}]);
     } catch { setChat(p=>[...p,{role:"assistant",text:"Error: Could not reach the backend.",isError:true}]); }
     setQuerying(false);
   };
@@ -651,17 +651,49 @@ export default function PaperTrail() {
                           <div className="pt-sources-label">Sources</div>
                           {msg.sources.map((s,si)=>(
                             <div key={si} className="pt-source-item">
-                              <span className="pt-source-paper">{s.paper_title}</span>
-                              {s.page != null && (
-                                <span style={{
-                                  marginLeft:6,padding:"1px 6px",borderRadius:4,
-                                  background:"rgba(232,168,56,0.12)",border:"1px solid rgba(232,168,56,0.3)",
-                                  color:"#e8a838",fontFamily:"var(--font-mono)",fontSize:10
-                                }}>p.{s.page}</span>
+                              <div>
+                                <span className="pt-source-paper">{s.paper_title}</span>
+                                {s.page != null && (
+                                  <span style={{
+                                    marginLeft:6,padding:"1px 6px",borderRadius:4,
+                                    background:"rgba(232,168,56,0.12)",border:"1px solid rgba(232,168,56,0.3)",
+                                    color:"#e8a838",fontFamily:"var(--font-mono)",fontSize:10
+                                  }}>p.{s.page}</span>
+                                )}
+                                {s.verified && (
+                                  <span title="Quote verified against source chunk" style={{
+                                    marginLeft:6,padding:"1px 6px",borderRadius:4,
+                                    background:"rgba(60,180,120,0.12)",border:"1px solid rgba(60,180,120,0.3)",
+                                    color:"#3cb478",fontFamily:"var(--font-mono)",fontSize:10
+                                  }}>✓ verified</span>
+                                )}
+                                {s.relevant_detail && <span className="pt-source-detail"> — {s.relevant_detail}</span>}
+                              </div>
+                              {s.quote && (
+                                <div style={{
+                                  marginTop:4,paddingLeft:10,
+                                  borderLeft:"2px solid rgba(232,168,56,0.4)",
+                                  fontStyle:"italic",color:"var(--muted)",fontSize:12
+                                }}>
+                                  "{s.quote}"
+                                </div>
                               )}
-                              {s.relevant_detail && <span className="pt-source-detail"> — {s.relevant_detail}</span>}
                             </div>
                           ))}
+                        </div>
+                      )}
+
+                      {msg.unsupported?.length>0 && (
+                        <div style={{
+                          marginTop:8,padding:"8px 10px",borderRadius:6,
+                          background:"rgba(220,80,80,0.08)",border:"1px solid rgba(220,80,80,0.25)"
+                        }}>
+                          <div style={{fontSize:11,color:"#dc5050",fontWeight:600,marginBottom:4}}>
+                            ⚠ Claims not supported by retrieved passages
+                          </div>
+                          <ul style={{margin:0,paddingLeft:16,fontSize:12,color:"var(--muted)"}}>
+                            {msg.unsupported.map((c,i)=><li key={i} style={{marginTop:2}}>{c}</li>)}
+                          </ul>
                         </div>
                       )}
 

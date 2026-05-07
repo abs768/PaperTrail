@@ -96,6 +96,129 @@ def load_state():
 load_state()
 
 
+# ── Hybrid retrieval state (BM25 alongside vector store) ──────────────────────
+_bm25_index = None  # rank_bm25.BM25Okapi
+_bm25_chunk_ids: list[str] = []  # parallel arrays — same index across all three
+_bm25_paper_ids: list[str] = []
+_bm25_dirty = True
+
+
+def _bm25_tokenize(s: str) -> list[str]:
+    """Lightweight tokenizer: lowercase, alnum runs only."""
+    return re.findall(r"[a-z0-9]+", (s or "").lower())
+
+
+def _rebuild_bm25_index() -> None:
+    """Rebuild the in-memory BM25 index from the current ChromaDB collection.
+    Cheap for small libraries; we just rebuild on every add/delete."""
+    global _bm25_index, _bm25_chunk_ids, _bm25_paper_ids, _bm25_dirty
+    try:
+        if collection.count() == 0:
+            _bm25_index = None
+            _bm25_chunk_ids = []
+            _bm25_paper_ids = []
+            _bm25_dirty = False
+            return
+        from rank_bm25 import BM25Okapi
+        data = collection.get(include=["documents", "metadatas"])
+        ids = data.get("ids") or []
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or [{} for _ in docs]
+        tokenized = [_bm25_tokenize(d) for d in docs]
+        if not tokenized or not any(tokenized):
+            _bm25_index = None
+            _bm25_chunk_ids = []
+            _bm25_paper_ids = []
+        else:
+            _bm25_index = BM25Okapi(tokenized)
+            _bm25_chunk_ids = list(ids)
+            _bm25_paper_ids = [(m or {}).get("paper_id", "") for m in metas]
+        _bm25_dirty = False
+        logger.info(f"BM25 index rebuilt over {len(_bm25_chunk_ids)} chunks")
+    except Exception as e:
+        logger.warning(f"BM25 rebuild failed (will fall back to vector-only): {e}")
+        _bm25_index = None
+        _bm25_chunk_ids = []
+        _bm25_paper_ids = []
+        _bm25_dirty = False
+
+
+def _ensure_bm25() -> None:
+    if _bm25_dirty:
+        _rebuild_bm25_index()
+
+
+def _bm25_search(query: str, top_k: int, paper_ids: list = None) -> list[tuple[str, float]]:
+    """Return [(chunk_id, score), …] ranked by BM25. Empty if no index."""
+    _ensure_bm25()
+    if _bm25_index is None or not _bm25_chunk_ids:
+        return []
+    tokens = _bm25_tokenize(query)
+    if not tokens:
+        return []
+    scores = _bm25_index.get_scores(tokens)
+    pid_set = set(paper_ids) if paper_ids else None
+    indexed = [
+        (i, s) for i, s in enumerate(scores)
+        if s > 0 and (pid_set is None or _bm25_paper_ids[i] in pid_set)
+    ]
+    indexed.sort(key=lambda t: t[1], reverse=True)
+    return [(_bm25_chunk_ids[i], s) for i, s in indexed[:top_k]]
+
+
+_rebuild_bm25_index()
+
+
+# ── Cross-encoder reranker (opt-in) ───────────────────────────────────────────
+# Re-scores (query, passage) pairs after the hybrid fusion. Heavy to load
+# (~80MB + torch warm-up), so gated behind ENABLE_RERANKER=1.
+_reranker = None
+_reranker_load_attempted = False
+
+
+def _reranker_enabled() -> bool:
+    return os.getenv("ENABLE_RERANKER", "").lower() in ("1", "true", "yes", "on")
+
+
+def _get_reranker():
+    global _reranker, _reranker_load_attempted
+    if _reranker_load_attempted:
+        return _reranker
+    _reranker_load_attempted = True
+    if not _reranker_enabled():
+        return None
+    try:
+        from sentence_transformers import CrossEncoder
+        model_name = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        logger.info(f"Loading cross-encoder reranker: {model_name}")
+        _reranker = CrossEncoder(model_name)
+        logger.info("Reranker loaded.")
+    except Exception as e:
+        logger.warning(f"Reranker disabled — failed to load: {e}")
+        _reranker = None
+    return _reranker
+
+
+def _rerank_chunks(query: str, chunks: list[dict], top_k: int) -> list[dict]:
+    """Re-score (query, chunk.text) pairs with the cross-encoder, return top_k.
+    Falls through to fused order if the reranker is disabled or errors."""
+    rer = _get_reranker()
+    if rer is None or not chunks:
+        return chunks[:top_k]
+    try:
+        pairs = [(query, c.get("text", "") or "") for c in chunks]
+        scores = rer.predict(pairs)
+    except Exception as e:
+        logger.warning(f"Rerank failed, falling back to fused order: {e}")
+        return chunks[:top_k]
+    scored = sorted(
+        ((float(s), c) for s, c in zip(scores, chunks)),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+    return [{**c, "rerank_score": round(s, 4)} for s, c in scored[:top_k]]
+
+
 # LLM client — Groq (OpenAI-compatible API), with optional Gemini fallback
 _GROQ_KEY = os.getenv("GROQ_API_KEY")
 _GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -249,9 +372,43 @@ class QueryClassification(BaseModel):
 
 
 class CitedSource(BaseModel):
-    paper_title: str = Field(description="Title of the source paper — MUST exactly match a paper in the supplied context")
-    relevant_detail: str = Field(description="Specific detail used from this paper")
-    page: Optional[int] = Field(default=None, description="Page number where the detail was found, if known")
+    """A grounded citation. paper_title and page are derived server-side from
+    passage_idx — do not have the LLM emit them. The LLM emits only:
+      - passage_idx: the 1-indexed passage number it pulled the quote from
+      - quote: a verbatim contiguous quote from that passage's text
+      - relevant_detail: one short sentence describing what the quote supports
+    """
+
+    passage_idx: int = Field(
+        description="1-indexed passage number from the numbered context list. MUST refer to an actual supplied passage."
+    )
+    quote: str = Field(
+        description="Verbatim contiguous quote (5-30 words) copied character-for-character from the passage. No paraphrasing."
+    )
+    relevant_detail: str = Field(
+        description="One short sentence describing what claim this quote supports."
+    )
+    # Filled in server-side from passage_idx — LLM does not emit these.
+    paper_title: Optional[str] = Field(default=None)
+    page: Optional[int] = Field(default=None)
+    chunk_id: Optional[str] = Field(default=None)
+    verified: Optional[bool] = Field(default=None)
+
+
+class FaithfulnessReport(BaseModel):
+    """Output of the post-generation fact-check pass."""
+
+    unsupported_claims: list[str] = Field(
+        description="Substantive factual claims from the ANSWER that are NOT supported by any PASSAGE. "
+                    "Quote each claim verbatim from the answer. Skip meta-statements, hedges, and definitions."
+    )
+    support_score: float = Field(
+        description="Fraction of substantive factual claims in the ANSWER that ARE supported by the PASSAGES (0..1)."
+    )
+    notes: str = Field(
+        default="",
+        description="One-sentence reasoning."
+    )
 
 
 class QueryAnswer(BaseModel):
@@ -259,7 +416,7 @@ class QueryAnswer(BaseModel):
 
     answer: str = Field(description="Clear, comprehensive answer to the question")
     sources: list[CitedSource] = Field(
-        description="Papers cited in the answer with specific details"
+        description="Grounded citations. Each source must reference a numbered passage and quote it verbatim."
     )
     confidence: float = Field(
         description="Confidence in the answer (0-1), lower if context was sparse"
@@ -326,10 +483,10 @@ tools = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def search_vector_store(query: str, top_k: int = 5, paper_ids: list = None) -> str:
-    """Search ChromaDB for relevant chunks. Optionally restrict to specific paper IDs."""
+def _vector_search_raw(query: str, top_k: int, paper_ids: list = None) -> list[dict]:
+    """Pure vector search via ChromaDB. Returns chunk dicts with full text."""
     if collection.count() == 0:
-        return json.dumps({"results": [], "message": "No papers indexed yet."})
+        return []
 
     where = None
     if paper_ids:
@@ -340,20 +497,120 @@ def search_vector_store(query: str, top_k: int = 5, paper_ids: list = None) -> s
         kwargs["where"] = where
 
     results = collection.query(**kwargs)
+    if not results.get("documents") or not results["documents"][0]:
+        return []
 
     matches = []
     for i in range(len(results["documents"][0])):
         meta = results["metadatas"][0][i] or {}
+        chunk_id = (results.get("ids") or [[]])[0][i] if results.get("ids") else None
         matches.append(
             {
-                "text": results["documents"][0][i][:600],
+                "chunk_id": chunk_id,
+                "paper_id": meta.get("paper_id"),
                 "paper_title": meta.get("title", "Unknown"),
                 "page": meta.get("page"),
+                "text": results["documents"][0][i],
                 "distance": round(results["distances"][0][i], 4)
                 if results.get("distances")
                 else None,
             }
         )
+    return matches
+
+
+def _hydrate_chunks(chunk_ids: list[str]) -> dict[str, dict]:
+    """Fetch chunk dicts (text + metadata) for a list of ids. Useful for BM25-only hits."""
+    if not chunk_ids:
+        return {}
+    try:
+        got = collection.get(ids=list(chunk_ids), include=["documents", "metadatas"])
+    except Exception as e:
+        logger.warning(f"Hydration fetch failed: {e}")
+        return {}
+    out: dict[str, dict] = {}
+    for i, cid in enumerate(got.get("ids") or []):
+        meta = (got.get("metadatas") or [{}])[i] or {}
+        text = (got.get("documents") or [""])[i] or ""
+        out[cid] = {
+            "chunk_id": cid,
+            "paper_id": meta.get("paper_id"),
+            "paper_title": meta.get("title", "Unknown"),
+            "page": meta.get("page"),
+            "text": text,
+            "distance": None,
+        }
+    return out
+
+
+def _search_chunks(
+    query: str,
+    top_k: int = 5,
+    paper_ids: list = None,
+    truncate_to: Optional[int] = None,
+) -> list[dict]:
+    """Hybrid retrieval: vector + BM25 fused via Reciprocal Rank Fusion.
+
+    Each result dict has: chunk_id, paper_id, paper_title, page, text, distance.
+    `truncate_to=None` returns full text (used for grounding); a positive int
+    truncates (used for the LLM-facing tool wrapper).
+    """
+    if collection.count() == 0:
+        return []
+
+    # Overshoot top_k on each lane so RRF has more material to fuse over.
+    # Wider pool when reranker is on — it benefits from more candidates.
+    pool_mult = 6 if _reranker_enabled() else 3
+    pool_n = max(top_k * pool_mult, 20)
+
+    vector_hits = _vector_search_raw(query, pool_n, paper_ids)
+    bm25_hits = _bm25_search(query, pool_n, paper_ids)
+
+    # Reciprocal Rank Fusion. K=60 is the standard constant from the original
+    # RRF paper (Cormack et al.); damps top-rank dominance.
+    K_RRF = 60
+    rrf: dict[str, float] = {}
+    for rank, c in enumerate(vector_hits):
+        cid = c.get("chunk_id")
+        if cid:
+            rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (K_RRF + rank + 1)
+    for rank, (cid, _score) in enumerate(bm25_hits):
+        rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (K_RRF + rank + 1)
+
+    # Hydrate any chunk ids that came only from BM25 (no vector hit).
+    by_id = {c["chunk_id"]: c for c in vector_hits if c.get("chunk_id")}
+    missing = [cid for cid in rrf.keys() if cid not in by_id]
+    if missing:
+        by_id.update(_hydrate_chunks(missing))
+
+    # Sort by fused score, drop anything we couldn't hydrate.
+    ordered = sorted(rrf.keys(), key=lambda x: rrf[x], reverse=True)
+    fused: list[dict] = []
+    for cid in ordered:
+        chunk = by_id.get(cid)
+        if chunk is None:
+            continue
+        # Stamp the fusion score so callers can inspect it.
+        fused.append({**chunk, "rrf_score": round(rrf[cid], 5)})
+
+    # Cross-encoder rerank (opt-in via ENABLE_RERANKER) — pulls top_k from the pool.
+    final = _rerank_chunks(query, fused, top_k) if _reranker_enabled() else fused[:top_k]
+
+    if truncate_to:
+        final = [
+            {**c, "text": (c["text"][:truncate_to] if c.get("text") and len(c["text"]) > truncate_to else c.get("text"))}
+            for c in final
+        ]
+    return final
+
+
+def search_vector_store(query: str, top_k: int = 5, paper_ids: list = None) -> str:
+    """JSON wrapper used by the function-calling tool surface. Truncates text
+    to 600 chars to keep the tool-result payload small. For grounding, call
+    `_search_chunks` directly to get full text + chunk_id."""
+    matches = _search_chunks(query, top_k=top_k, paper_ids=paper_ids, truncate_to=600)
+    if not matches:
+        return json.dumps({"results": [], "message": "No papers indexed yet."})
     return json.dumps({"results": matches})
 
 
@@ -474,27 +731,91 @@ def extract_text_from_pdf(file_path: str) -> list[dict]:
     return pages
 
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i : i + chunk_size])
-        if chunk:
-            chunks.append(chunk)
+# Paragraph and sentence boundaries — used by the chunker to avoid mid-sentence cuts.
+_PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
+# Split on .!? followed by whitespace + uppercase / quote / paren start.
+# Naive but adequate for English research-paper prose.
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\"'])")
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    return [p.strip() for p in _PARA_SPLIT_RE.split(text or "") if p.strip()]
+
+
+def _split_sentences(para: str) -> list[str]:
+    sents = _SENT_SPLIT_RE.split(para or "")
+    return [s.strip() for s in sents if s.strip()]
+
+
+def _word_count(s: str) -> int:
+    return len((s or "").split())
+
+
+def _pack_units(units: list[str], target_words: int, overlap_words: int) -> list[str]:
+    """Greedy pack of text units (paragraphs or sentences) into target-sized chunks
+    with word-level overlap from the prior chunk's tail. If a single unit exceeds
+    `target_words`, it is recursively split into sentences."""
+    chunks: list[str] = []
+    cur = ""
+    cur_wc = 0
+
+    def flush_with_overlap(next_unit: str) -> tuple[str, int]:
+        words = cur.split()
+        tail = " ".join(words[-overlap_words:]) if len(words) > overlap_words else cur
+        new = (tail + "\n\n" + next_unit) if tail else next_unit
+        return new, _word_count(new)
+
+    for u in units:
+        uwc = _word_count(u)
+        if uwc > target_words:
+            # Single unit too big — flush current, then chunk this unit by sentence.
+            if cur:
+                chunks.append(cur)
+                cur, cur_wc = "", 0
+            sentences = _split_sentences(u)
+            if len(sentences) <= 1:
+                # Sentence splitter couldn't break it (e.g. one giant sentence /
+                # garbled OCR). Fall back to a hard word window so the chunk
+                # still fits the embedding budget.
+                words = u.split()
+                stride = max(1, target_words - overlap_words)
+                for i in range(0, len(words), stride):
+                    piece = " ".join(words[i : i + target_words])
+                    if piece:
+                        chunks.append(piece)
+            else:
+                chunks.extend(_pack_units(sentences, target_words, overlap_words))
+            continue
+
+        if not cur or cur_wc + uwc <= target_words:
+            cur = (cur + "\n\n" + u) if cur else u
+            cur_wc += uwc
+        else:
+            chunks.append(cur)
+            cur, cur_wc = flush_with_overlap(u)
+    if cur:
+        chunks.append(cur)
     return chunks
 
 
-def chunk_pages(pages: list[dict], chunk_size: int = 500, overlap: int = 100) -> list[dict]:
-    """Chunk per-page so we can keep page-level provenance on every chunk."""
-    out = []
+def chunk_text(text: str, target_words: int = 400, overlap_words: int = 80) -> list[str]:
+    """Paragraph- then sentence-aware chunking. Used for notes (no page metadata)."""
+    paras = _split_paragraphs(text)
+    if not paras:
+        return []
+    return [c for c in _pack_units(paras, target_words, overlap_words) if c.strip()]
+
+
+def chunk_pages(pages: list[dict], target_words: int = 400, overlap_words: int = 80) -> list[dict]:
+    """Chunk per-page so each chunk carries a single page number for provenance."""
+    out: list[dict] = []
     for p in pages:
-        words = p["text"].split()
-        if not words:
+        paras = _split_paragraphs(p["text"])
+        if not paras:
             continue
-        for i in range(0, len(words), chunk_size - overlap):
-            text = " ".join(words[i : i + chunk_size])
-            if text:
-                out.append({"text": text, "page": p["page"]})
+        for chunk in _pack_units(paras, target_words, overlap_words):
+            if chunk.strip():
+                out.append({"text": chunk, "page": p["page"]})
     return out
 
 
@@ -503,58 +824,224 @@ def chunk_pages(pages: list[dict], chunk_size: int = 500, overlap: int = 100) ->
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+_EXTRACT_SYS_PROMPT = (
+    "You are an expert academic entity extractor. "
+    "Given text from a research paper, extract all structured entities and relationships. "
+    "Be thorough — extract every author, method, dataset, metric, and concept you can find.\n\n"
+    "USE CANONICAL NAMES so the same entity in two papers can be linked:\n"
+    "  • methods: 'attention' (not 'attention mechanism'), 'encoder-decoder', 'transformer', "
+    "'recurrent neural network' (not 'RNN'), 'long short-term memory' (not 'LSTM')\n"
+    "  • datasets: 'WMT 2014 en-fr' (not 'WMT'14 English-French translation task'), "
+    "'WMT 2014 en-de', 'GLUE', 'SQuAD'\n"
+    "  • metrics: 'BLEU' (not 'BLEU score'), 'F1', 'accuracy', 'perplexity'\n"
+    "  • do NOT append words like 'model', 'mechanism', 'approach', 'task' to a name\n\n"
+    "DO NOT INVENT entities. If you are not certain a method/dataset/metric is explicitly mentioned in THIS section, "
+    "leave it out — a downstream validator will drop entities that do not appear verbatim in the source. "
+    "For relationships, only extract those grounded in this section's text "
+    "(e.g., a method 'uses' a dataset, a paper 'proposes' an algorithm, a model 'outperforms' a baseline)."
+)
+
+
+def _slice_for_extraction(text: str, max_chunks: int = 5, target_chars: int = 6000, overlap_chars: int = 400) -> list[str]:
+    """Slice the paper into windows for multi-pass extraction. Always keeps the
+    head (title/abstract/intro) and the tail (results/conclusion); fills the
+    middle up to `max_chunks` total."""
+    text = text or ""
+    if len(text) <= target_chars:
+        return [text] if text.strip() else []
+    stride = target_chars - overlap_chars
+    windows = []
+    i = 0
+    while i < len(text) and len(windows) < max_chunks - 1:  # reserve last slot for tail
+        windows.append(text[i : i + target_chars])
+        i += stride
+    # Always include the tail explicitly so we don't miss late sections.
+    tail = text[-target_chars:]
+    if not windows or windows[-1] != tail:
+        windows.append(tail)
+    return windows[:max_chunks]
+
+
+def _merge_extractions(extractions: list[dict]) -> dict:
+    """Merge per-chunk PaperEntities dicts. Dedupe by canonical form."""
+    merged = _empty_extraction()
+    # Title: prefer the first non-empty (typically from the head chunk).
+    for e in extractions:
+        if e.get("title"):
+            merged["title"] = e["title"]
+            break
+
+    def _dedupe_strs(field: str):
+        seen, keep = set(), []
+        for e in extractions:
+            for v in e.get(field, []) or []:
+                c = _canonicalize_entity(v)
+                if c and c not in seen:
+                    seen.add(c)
+                    keep.append(v)
+        return keep
+
+    merged["authors"] = _dedupe_strs("authors")
+    merged["methods"] = _dedupe_strs("methods")
+    merged["datasets"] = _dedupe_strs("datasets")
+    merged["key_concepts"] = _dedupe_strs("key_concepts")
+
+    # Metrics: keyed on (canonical name, value).
+    seen_metrics = set()
+    for e in extractions:
+        for m in e.get("metrics", []) or []:
+            if isinstance(m, dict):
+                name, val = m.get("name", ""), m.get("value", "")
+            else:
+                name, val = str(m), ""
+            key = (_canonicalize_entity(name), str(val))
+            if key[0] and key not in seen_metrics:
+                seen_metrics.add(key)
+                merged["metrics"].append(
+                    m if isinstance(m, dict) else {"name": str(m), "value": ""}
+                )
+
+    # Relationships: keyed on (canon src, relation, canon tgt).
+    seen_rels = set()
+    for e in extractions:
+        for r in e.get("relationships", []) or []:
+            src = _canonicalize_entity(r.get("source", ""))
+            tgt = _canonicalize_entity(r.get("target", ""))
+            rel = r.get("relation", "")
+            key = (src, rel, tgt)
+            if src and tgt and key not in seen_rels:
+                seen_rels.add(key)
+                merged["relationships"].append(r)
+    return merged
+
+
+def _normalize_for_appearance(s: str) -> str:
+    """Lowercase, strip parens/brackets, collapse whitespace.
+    Used for fuzzy substring tests when checking entity appearance in source."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[\(\)\[\]]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _entity_appears(name: str, text_lower: str) -> bool:
+    """True iff this entity name (or its canonical form) appears literally in the
+    source text — modulo whitespace and parens. Used to drop hallucinated entities."""
+    n = (name or "").lower().strip()
+    if not n or len(n) < 2:
+        return False
+    if n in text_lower:
+        return True
+    # Normalize both sides (strip parens, collapse whitespace).
+    nn = _normalize_for_appearance(n)
+    nt = _normalize_for_appearance(text_lower)
+    if nn and nn in nt:
+        return True
+    canon = _canonicalize_entity(name)
+    if canon and (canon in text_lower or canon in nt):
+        return True
+    return False
+
+
+def _validate_extraction(entities: dict, full_text: str) -> tuple[dict, dict]:
+    """Drop entities whose surface form doesn't appear in the source. Returns (kept, dropped_counts)."""
+    text_lower = (full_text or "").lower()
+    out = dict(entities)
+    dropped = {"authors": 0, "methods": 0, "datasets": 0, "key_concepts": 0, "metrics": 0, "relationships": 0}
+
+    def filt(field: str) -> list:
+        kept = []
+        for v in entities.get(field, []) or []:
+            if _entity_appears(v, text_lower):
+                kept.append(v)
+            else:
+                dropped[field] += 1
+        return kept
+
+    out["authors"] = filt("authors")
+    out["methods"] = filt("methods")
+    out["datasets"] = filt("datasets")
+    out["key_concepts"] = filt("key_concepts")
+
+    metrics = []
+    for m in entities.get("metrics", []) or []:
+        name = m.get("name", "") if isinstance(m, dict) else str(m)
+        if _entity_appears(name, text_lower):
+            metrics.append(m)
+        else:
+            dropped["metrics"] += 1
+    out["metrics"] = metrics
+
+    rels = []
+    for r in entities.get("relationships", []) or []:
+        if _entity_appears(r.get("source", ""), text_lower) and _entity_appears(r.get("target", ""), text_lower):
+            rels.append(r)
+        else:
+            dropped["relationships"] += 1
+    out["relationships"] = rels
+
+    return out, dropped
+
+
 def extract_entities(text: str) -> dict:
-    """
-    Use GPT-4o with Pydantic structured output to extract entities.
-    Pattern: Structured Outputs (response_format=PaperEntities)
+    """Multi-pass entity extraction over the full paper, with validation.
+
+    Pipeline:
+      1. Slice the paper into ~6k-char windows (overlapping). Cap at 5 windows.
+      2. Run structured extraction on each slice.
+      3. Merge — dedupe entities by canonical form.
+      4. Validate — drop entities that don't literally appear in the source.
     """
     if not client:
-        logger.warning("No OpenAI key — returning empty extraction")
+        logger.warning("No LLM key — returning empty extraction")
         return _empty_extraction()
 
-    try:
-        logger.info("Extracting entities via structured JSON output...")
-        # Two-pass extraction over the whole paper, not just the abstract.
-        head = text[:6000]
-        tail = text[-6000:] if len(text) > 12000 else ""
-        body = head if not tail else f"{head}\n\n[…middle elided…]\n\n{tail}"
-        result = _parse_structured(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert academic entity extractor. "
-                        "Given text from a research paper, extract all structured entities and relationships. "
-                        "Be thorough — extract every author, method, dataset, metric, and concept you can find.\n\n"
-                        "USE CANONICAL NAMES so the same entity in two papers can be linked:\n"
-                        "  • methods: 'attention' (not 'attention mechanism'), 'encoder-decoder', 'transformer', "
-                        "'recurrent neural network' (not 'RNN'), 'long short-term memory' (not 'LSTM')\n"
-                        "  • datasets: 'WMT 2014 en-fr' (not 'WMT'14 English-French translation task'), "
-                        "'WMT 2014 en-de', 'GLUE', 'SQuAD'\n"
-                        "  • metrics: 'BLEU' (not 'BLEU score'), 'F1', 'accuracy', 'perplexity'\n"
-                        "  • do NOT append words like 'model', 'mechanism', 'approach', 'task' to a name\n\n"
-                        "For relationships, identify how entities relate to each other "
-                        "(e.g., a method 'uses' a dataset, a paper 'proposes' an algorithm, a model 'outperforms' a baseline)."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Extract all entities and relationships from this research paper text:\n\n{body}",
-                },
-            ],
-            response_model=PaperEntities,
-            model=MODEL_FAST,
-        )
-        logger.info(
-            f"Extraction complete — {len(result.authors)} authors, {len(result.methods)} methods, "
-            f"{len(result.datasets)} datasets, {len(result.key_concepts)} concepts, "
-            f"{len(result.relationships)} relationships"
-        )
-        return result.model_dump()
-
-    except Exception as e:
-        logger.error(f"Entity extraction failed: {e}")
+    slices = _slice_for_extraction(text)
+    if not slices:
         return _empty_extraction()
+
+    logger.info("Extracting entities over %d slice(s) of length up to ~%d chars...",
+                len(slices), max((len(s) for s in slices), default=0))
+
+    extractions: list[dict] = []
+    for idx, sl in enumerate(slices):
+        try:
+            result = _parse_structured(
+                messages=[
+                    {"role": "system", "content": _EXTRACT_SYS_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Extract entities and relationships from this section "
+                            f"({idx+1}/{len(slices)}) of a research paper:\n\n{sl}"
+                        ),
+                    },
+                ],
+                response_model=PaperEntities,
+                model=MODEL_FAST,
+            )
+            extractions.append(result.model_dump())
+        except Exception as e:
+            logger.warning(f"Extraction pass {idx+1}/{len(slices)} failed: {e}")
+            continue
+
+    if not extractions:
+        return _empty_extraction()
+
+    merged = _merge_extractions(extractions)
+    validated, dropped_counts = _validate_extraction(merged, text)
+
+    logger.info(
+        "Extraction complete (%d/%d passes) — %d authors, %d methods, %d datasets, "
+        "%d concepts, %d metrics, %d relationships (dropped by validation: %s)",
+        len(extractions), len(slices),
+        len(validated["authors"]), len(validated["methods"]), len(validated["datasets"]),
+        len(validated["key_concepts"]), len(validated["metrics"]), len(validated["relationships"]),
+        dropped_counts,
+    )
+    return validated
 
 
 def _empty_extraction() -> dict:
@@ -777,6 +1264,8 @@ def add_to_vector_store(paper_id: str, chunks, metadata: dict):
             meta["page"] = page
         metas.append(meta)
     collection.add(documents=docs, ids=ids, metadatas=metas)
+    global _bm25_dirty
+    _bm25_dirty = True
     logger.info(f"Added {len(docs)} chunks to vector store")
 
 
@@ -803,41 +1292,126 @@ def _papers_in_subgraph(subgraph_json: str) -> list[str]:
     return list(paper_ids)
 
 
-def _filter_hallucinated_sources(sources: list, library_titles: list[str]) -> tuple[list, list]:
-    """Drop sources whose paper_title doesn't fuzzy-match any indexed paper.
+# ── Quote grounding ────────────────────────────────────────────────────────────
+_QUOTE_NORMALIZE_RE = re.compile(r"\s+")
+_QUOTE_PUNCT_RE = re.compile(r"[‘’`´]")
+_QUOTE_DQUOTE_RE = re.compile(r"[“”]")
 
-    Returns (kept, dropped) where dropped is a list of {paper_title, reason}.
+
+def _normalize_for_quote_match(s: str) -> str:
+    if not s:
+        return ""
+    s = _QUOTE_PUNCT_RE.sub("'", s)
+    s = _QUOTE_DQUOTE_RE.sub('"', s)
+    s = s.lower()
+    s = _QUOTE_NORMALIZE_RE.sub(" ", s).strip()
+    return s
+
+
+def _verify_quote(quote: str, chunk_text: str, min_words: int = 3, fuzzy_threshold: float = 0.85) -> bool:
+    """Return True if `quote` is plausibly verbatim within `chunk_text`.
+
+    Strategy:
+      1. Normalize whitespace + smart-quotes + case on both sides.
+      2. Exact substring? Accept.
+      3. Otherwise, slide a same-length window across the chunk and accept if
+         any window has SequenceMatcher ratio >= fuzzy_threshold (handles minor
+         OCR/whitespace artifacts without letting paraphrases through).
+      4. Reject quotes shorter than `min_words` words — they are too weak to
+         constitute grounding.
     """
-    kept, dropped = [], []
-    library_lower = [(t or "").lower() for t in library_titles]
-    for s in sources:
-        cited = (s.get("paper_title") or "").lower().strip()
-        if not cited:
-            dropped.append({"paper_title": s.get("paper_title"), "reason": "empty title"})
-            continue
-        match = any(
-            cited == lt
-            or (cited and lt and (cited in lt or lt in cited))
-            or (cited and lt and len(cited) > 8 and len(lt) > 8 and (cited[:20] in lt or lt[:20] in cited))
-            for lt in library_lower
+    if not quote or not chunk_text:
+        return False
+    nq = _normalize_for_quote_match(quote)
+    nc = _normalize_for_quote_match(chunk_text)
+    if len(nq.split()) < min_words:
+        return False
+    if nq in nc:
+        return True
+    # Fuzzy fallback: scan windows of same length as the quote.
+    import difflib
+    L = len(nq)
+    if L > len(nc):
+        return False
+    # Coarse stride to keep this O(n) — granularity ~quote length / 4.
+    stride = max(1, L // 4)
+    best = 0.0
+    for i in range(0, len(nc) - L + 1, stride):
+        ratio = difflib.SequenceMatcher(None, nq, nc[i : i + L]).ratio()
+        if ratio > best:
+            best = ratio
+            if best >= fuzzy_threshold:
+                return True
+    return False
+
+
+def _check_faithfulness(question: str, answer: str, passages_block: str, graph_block: str) -> Optional[FaithfulnessReport]:
+    """Strict fact-check: flag substantive claims in the answer that no passage
+    supports. Returns None on failure (we don't want a verifier hiccup to block
+    the whole query — we just lose the faithfulness signal)."""
+    if not client:
+        return None
+    if not answer or not answer.strip():
+        return None
+    # Empty retrieval → we can't verify anything. Mark as zero support.
+    if not passages_block or "(none retrieved)" in passages_block:
+        return FaithfulnessReport(
+            unsupported_claims=[],
+            support_score=0.0 if answer.strip() else 1.0,
+            notes="No passages retrieved; no grounding available.",
         )
-        if match:
-            kept.append(s)
-        else:
-            dropped.append({"paper_title": s.get("paper_title"), "reason": "not in library"})
-    return kept, dropped
+
+    sys_prompt = (
+        "You are a strict fact-checker. You will be given a QUESTION, the PASSAGES that were retrieved "
+        "from the user's library, optionally a KNOWLEDGE GRAPH SUBGRAPH, and an ANSWER produced by another model. "
+        "Your job is to identify any SUBSTANTIVE FACTUAL CLAIM in the ANSWER that is NOT supported by either the "
+        "PASSAGES or the SUBGRAPH.\n\n"
+        "What counts as a substantive factual claim:\n"
+        "  • specific results / numbers / metrics\n"
+        "  • who proposed / authored / introduced what\n"
+        "  • method X uses / outperforms / extends Y\n"
+        "  • dataset / benchmark mentions\n"
+        "  • cross-paper comparisons\n"
+        "Do NOT flag: meta-statements ('the papers say...', 'based on context'), hedges, generic background "
+        "definitions, or restatements of the question.\n\n"
+        "A claim is supported if some passage or subgraph triple states or directly entails it. "
+        "Lexical paraphrase is OK; logical leaps are NOT.\n\n"
+        "Quote each unsupported claim verbatim from the ANSWER (a short phrase or sentence). "
+        "Then output support_score = (supported substantive claims) / (total substantive claims), in [0,1]."
+    )
+    user_prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"{graph_block}\n\n{passages_block}\n\n"
+        f"ANSWER TO VERIFY:\n{answer}"
+    )
+    try:
+        return _parse_structured(
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_model=FaithfulnessReport,
+            model=MODEL_FAST,
+        )
+    except Exception as e:
+        logger.warning(f"Faithfulness check failed: {e}")
+        return None
 
 
 def graphrag_query(question: str, top_k: int = 5) -> dict:
     """
-    GraphRAG query pipeline (deterministic, graph-driven):
-      1. Classify query → query_type, key_entities, search_strategy
-      2. Pre-retrieve graph subgraph + vector chunks based on classification
-         - For comparative/relational queries, vector search is restricted to
-           papers found in the graph subgraph
-      3. Single structured-output call generates an answer that MUST cite only
-         the supplied context (no training-data leakage)
-      4. Post-filter: drop any cited paper that isn't actually in the library
+    GraphRAG query pipeline (deterministic, graph-driven, grounded):
+      1. Classify query → query_type, key_entities, search_strategy.
+      2. Pull a 2-hop graph subgraph around key_entities (text format).
+      3. Hybrid (BM25 + vector + RRF, optionally cross-encoder reranked) retrieval.
+         For comparative/relational queries, retrieve a balanced top-N PER paper
+         in the subgraph so one paper doesn't crowd the others out.
+      4. LLM produces a structured answer with citations as (passage_idx, quote).
+      5. Verify each citation: drop any whose quote doesn't actually appear in
+         the cited passage (paper_title and page are derived server-side from
+         the passage, never the LLM).
+      6. Faithfulness check: a second LLM pass flags substantive claims in the
+         answer that no passage supports. Confidence is bounded by the result.
     """
     if not client:
         vector_results = json.loads(search_vector_store(question, top_k))
@@ -891,38 +1465,56 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
     # so one paper doesn't crowd the others out of the context window.
     if qtype in ("comparative", "relational") and paper_ids_in_subgraph:
         per_paper_k = max(2, top_k // max(len(paper_ids_in_subgraph), 1))
-        merged: list = []
+        retrieved_chunks: list[dict] = []
         for pid in paper_ids_in_subgraph:
-            r = json.loads(search_vector_store(question, top_k=per_paper_k, paper_ids=[pid]))
-            merged.extend(r.get("results", []))
-        vector_raw = json.dumps({"results": merged})
-        vector_context = (
-            f"VECTOR PASSAGES (balanced — top {per_paper_k} per paper across "
-            f"{len(paper_ids_in_subgraph)} papers in subgraph):\n{vector_raw}"
+            retrieved_chunks.extend(_search_chunks(question, top_k=per_paper_k, paper_ids=[pid]))
+        retrieval_label = (
+            f"balanced — top {per_paper_k} per paper across "
+            f"{len(paper_ids_in_subgraph)} papers in subgraph"
         )
     else:
-        vector_raw = search_vector_store(question, top_k=top_k)
-        vector_context = f"VECTOR PASSAGES:\n{vector_raw}"
+        retrieved_chunks = _search_chunks(question, top_k=top_k)
+        retrieval_label = f"top {top_k}"
+
+    # Build numbered passage table the LLM cites by index.
+    passage_lookup: dict[int, dict] = {}
+    passage_blocks: list[str] = []
+    for i, c in enumerate(retrieved_chunks, start=1):
+        passage_lookup[i] = c
+        page = f"p.{c['page']}" if c.get("page") else "p.?"
+        ptitle = (c.get("paper_title") or "Unknown").replace("\n", " ")
+        passage_blocks.append(f"[{i}] (paper={ptitle!r} | {page})\n{c['text']}")
+    vector_context = (
+        f"VECTOR PASSAGES ({retrieval_label}):\n" + "\n\n".join(passage_blocks)
+        if passage_blocks
+        else "VECTOR PASSAGES: (none retrieved)"
+    )
 
     library_titles = [p.get("title", "") for p in papers_db.values()]
     library_listing = "\n".join(f"- {t}" for t in library_titles) or "(empty)"
 
     # ── Step 3: Generate cited answer ───────────────────────────────────
-    logger.info("Generating structured answer...")
+    logger.info("Generating structured answer over %d numbered passages...", len(passage_lookup))
     sys_prompt = (
         "You are PaperTrail, a research memory assistant. "
         "Answer the user's question using ONLY the supplied KNOWLEDGE GRAPH SUBGRAPH and VECTOR PASSAGES below. "
-        "DO NOT cite any paper that is not in the user's library listing. "
-        "If the supplied context is insufficient, say so plainly — do not fall back to your training data. "
-        "When citing, the paper_title field MUST exactly match a title from the user's library listing. "
-        "Include a page number on every CitedSource when the source passage has one."
+        "If the supplied context is insufficient, say so plainly — do not fall back to your training data.\n\n"
+        "GROUNDING RULES — every CitedSource you emit:\n"
+        "  • passage_idx: integer matching one of the numbered passages above (e.g., 3 for [3]). "
+        "Only the VECTOR PASSAGES are citable — the KG SUBGRAPH is for structural context, not direct citation.\n"
+        "  • quote: a CONTIGUOUS verbatim span (5–30 words) copied character-for-character from that exact passage's text. "
+        "Do NOT paraphrase. Do NOT merge text from multiple passages. The system will discard any citation whose quote "
+        "does not literally appear in the cited passage.\n"
+        "  • relevant_detail: one short sentence describing what the quote supports.\n"
+        "Do not include paper_title or page in your output — those are filled in from passage_idx automatically. "
+        "If you cannot find a passage that supports a claim, omit the citation rather than inventing one."
     )
     user_prompt = (
         f"User's library ({len(library_titles)} papers):\n{library_listing}\n\n"
         f"{graph_context}\n\n{vector_context}\n\n"
         f"Question: {question}\n\n"
-        f"Provide a clear, comprehensive answer grounded strictly in the context above. "
-        f"Cite each claim with the exact paper_title from the library listing and the page number when available."
+        f"Provide a clear, comprehensive answer grounded strictly in the context above, "
+        f"citing each claim with a passage_idx + verbatim quote."
     )
 
     try:
@@ -935,22 +1527,81 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
             model=MODEL_QUALITY,
         )
 
-        sources = [s.model_dump() for s in final.sources]
-        kept, dropped = _filter_hallucinated_sources(sources, library_titles)
-        if dropped:
-            logger.warning(f"Dropped {len(dropped)} hallucinated source(s): {[d['paper_title'] for d in dropped]}")
+        # Verify each citation against the actual passage text.
+        verified: list[dict] = []
+        dropped: list[dict] = []
+        for s in final.sources:
+            chunk = passage_lookup.get(s.passage_idx)
+            if not chunk:
+                dropped.append({
+                    "passage_idx": s.passage_idx,
+                    "quote": s.quote,
+                    "reason": "no such passage_idx",
+                })
+                continue
+            if not _verify_quote(s.quote, chunk["text"]):
+                dropped.append({
+                    "passage_idx": s.passage_idx,
+                    "paper_title": chunk.get("paper_title"),
+                    "quote": s.quote,
+                    "reason": "quote not found in passage",
+                })
+                continue
+            s.paper_title = chunk.get("paper_title")
+            s.page = chunk.get("page")
+            s.chunk_id = chunk.get("chunk_id")
+            s.verified = True
+            verified.append(s.model_dump())
 
-        logger.info(f"Answer generated — confidence: {final.confidence}, sources kept: {len(kept)}, dropped: {len(dropped)}")
+        if dropped:
+            logger.warning(
+                "Dropped %d unverifiable citation(s): %s",
+                len(dropped),
+                [(d.get("passage_idx"), d.get("reason")) for d in dropped],
+            )
+
+        # ── Step 4: Faithfulness check ──────────────────────────────────────
+        faith = _check_faithfulness(
+            question=question,
+            answer=final.answer,
+            passages_block=vector_context,
+            graph_block=graph_context,
+        )
+        unsupported = list(faith.unsupported_claims) if faith else []
+        support_score = faith.support_score if faith else None
+
+        # Adjust confidence: penalize for unverified citations AND for unsupported claims.
+        adj_confidence = final.confidence
+        total_emitted = len(verified) + len(dropped)
+        if total_emitted > 0 and len(dropped) / total_emitted >= 0.5:
+            adj_confidence = min(adj_confidence, 0.4)
+        if support_score is not None:
+            # Blend: trust the verifier as an upper bound on confidence.
+            adj_confidence = min(adj_confidence, support_score)
+        if unsupported:
+            adj_confidence = min(adj_confidence, max(0.1, 1.0 - 0.15 * len(unsupported)))
+
+        logger.info(
+            "Answer generated — confidence: %.2f (raw %.2f, support %.2f), "
+            "verified: %d, dropped: %d, unsupported: %d",
+            adj_confidence, final.confidence,
+            support_score if support_score is not None else -1.0,
+            len(verified), len(dropped), len(unsupported),
+        )
         return {
             "answer": final.answer,
-            "sources": kept,
+            "sources": verified,
             "dropped_sources": dropped,
-            "confidence": final.confidence,
+            "unsupported_claims": unsupported,
+            "support_score": support_score,
+            "confidence": adj_confidence,
+            "raw_confidence": final.confidence,
             "follow_up_questions": final.follow_up_questions,
             "query_type": qtype,
             "search_strategy": strategy,
             "graph_used": bool(qtype in ("comparative", "relational") and paper_ids_in_subgraph),
             "papers_in_subgraph": len(paper_ids_in_subgraph),
+            "passages_retrieved": len(passage_lookup),
         }
     except Exception as e:
         logger.error(f"Structured answer failed: {e}")
@@ -1191,6 +1842,8 @@ def delete_paper(paper_id: str):
     # Drop chunks
     try:
         collection.delete(where={"paper_id": paper_id})
+        global _bm25_dirty
+        _bm25_dirty = True
     except Exception as e:
         logger.warning(f"Chroma delete failed for {paper_id}: {e}")
     # Drop graph nodes that are exclusive to this paper (the paper node and any orphans)
@@ -1218,6 +1871,11 @@ def reset_system():
         embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
+    global _bm25_index, _bm25_chunk_ids, _bm25_paper_ids, _bm25_dirty
+    _bm25_index = None
+    _bm25_chunk_ids = []
+    _bm25_paper_ids = []
+    _bm25_dirty = False
     save_state()
     return {"message": "System reset complete"}
 
