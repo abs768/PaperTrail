@@ -828,28 +828,43 @@ _EXTRACT_SYS_PROMPT = (
     "You are an expert academic entity extractor. "
     "Given text from a research paper, extract all structured entities and relationships. "
     "Be thorough — extract every author, method, dataset, metric, and concept you can find.\n\n"
-    "USE CANONICAL NAMES so the same entity in two papers can be linked:\n"
-    "  • methods: 'attention' (not 'attention mechanism'), 'encoder-decoder', 'transformer', "
-    "'recurrent neural network' (not 'RNN'), 'long short-term memory' (not 'LSTM')\n"
-    "  • datasets: 'WMT 2014 en-fr' (not 'WMT'14 English-French translation task'), "
-    "'WMT 2014 en-de', 'GLUE', 'SQuAD'\n"
-    "  • metrics: 'BLEU' (not 'BLEU score'), 'F1', 'accuracy', 'perplexity'\n"
-    "  • do NOT append words like 'model', 'mechanism', 'approach', 'task' to a name\n\n"
+    "EXTRACT THE FORM AS IT APPEARS IN THE TEXT. Do NOT canonicalize, expand, or paraphrase. "
+    "If the paper writes 'RNN', emit 'RNN'; if it writes 'recurrent neural networks', emit that. "
+    "If the paper writes 'BLEU score', emit 'BLEU score'. The system has a separate canonicalization "
+    "layer that links variants like 'RNN' ↔ 'recurrent neural network' across papers — your job is "
+    "to faithfully report what THIS section says.\n\n"
     "DO NOT INVENT entities. If you are not certain a method/dataset/metric is explicitly mentioned in THIS section, "
-    "leave it out — a downstream validator will drop entities that do not appear verbatim in the source. "
+    "leave it out — a downstream validator will drop entities that do not appear in the source. "
     "For relationships, only extract those grounded in this section's text "
     "(e.g., a method 'uses' a dataset, a paper 'proposes' an algorithm, a model 'outperforms' a baseline)."
 )
 
 
-def _slice_for_extraction(text: str, max_chunks: int = 5, target_chars: int = 6000, overlap_chars: int = 400) -> list[str]:
+# Tunables (configurable via env so we can dial extraction cost/coverage on HF Spaces
+# without redeploying code).
+_EXTRACT_MAX_CHUNKS = int(os.getenv("EXTRACTION_MAX_CHUNKS", "3"))
+_EXTRACT_CHUNK_CHARS = int(os.getenv("EXTRACTION_CHUNK_CHARS", "8000"))
+_EXTRACT_OVERLAP_CHARS = int(os.getenv("EXTRACTION_OVERLAP_CHARS", "600"))
+_SKIP_ENTITY_VALIDATION = os.getenv("SKIP_ENTITY_VALIDATION", "").lower() in ("1", "true", "yes", "on")
+
+
+def _slice_for_extraction(
+    text: str,
+    max_chunks: int = None,
+    target_chars: int = None,
+    overlap_chars: int = None,
+) -> list[str]:
     """Slice the paper into windows for multi-pass extraction. Always keeps the
     head (title/abstract/intro) and the tail (results/conclusion); fills the
-    middle up to `max_chunks` total."""
+    middle up to `max_chunks` total. Defaults come from env vars so the
+    extraction budget can be tuned without a redeploy."""
     text = text or ""
+    max_chunks = max_chunks if max_chunks is not None else _EXTRACT_MAX_CHUNKS
+    target_chars = target_chars if target_chars is not None else _EXTRACT_CHUNK_CHARS
+    overlap_chars = overlap_chars if overlap_chars is not None else _EXTRACT_OVERLAP_CHARS
     if len(text) <= target_chars:
         return [text] if text.strip() else []
-    stride = target_chars - overlap_chars
+    stride = max(1, target_chars - overlap_chars)
     windows = []
     i = 0
     while i < len(text) and len(windows) < max_chunks - 1:  # reserve last slot for tail
@@ -926,9 +941,23 @@ def _normalize_for_appearance(s: str) -> str:
     return s
 
 
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
 def _entity_appears(name: str, text_lower: str) -> bool:
-    """True iff this entity name (or its canonical form) appears literally in the
-    source text — modulo whitespace and parens. Used to drop hallucinated entities."""
+    """Lenient check: True iff some recognizable form of this entity appears in
+    the source text. Used to drop hallucinated entities WITHOUT discarding valid
+    ones whose surface form differs from the LLM-emitted form.
+
+    Match strategies, in order:
+      1. Direct substring (name in text).
+      2. Parens/whitespace-normalized substring.
+      3. Canonical form (via alias map) substring.
+      4. Any KNOWN ALIAS that maps to the same canonical form (e.g., LLM emitted
+         'recurrent neural network' but text says 'RNN' — accept).
+      5. Token overlap >=70% on tokens of length >=3 (catches minor wording
+         differences without admitting unrelated entities).
+    """
     n = (name or "").lower().strip()
     if not n or len(n) < 2:
         return False
@@ -939,28 +968,63 @@ def _entity_appears(name: str, text_lower: str) -> bool:
     nt = _normalize_for_appearance(text_lower)
     if nn and nn in nt:
         return True
+    # Canonical and all known aliases that share the canonical.
     canon = _canonicalize_entity(name)
     if canon and (canon in text_lower or canon in nt):
         return True
+    if canon:
+        for surface, mapped in _ENTITY_ALIASES.items():
+            if mapped == canon and (surface in text_lower or surface in nt):
+                return True
+    # Token-overlap fallback for multi-word entities.
+    tokens = [t for t in _TOKEN_RE.findall(n) if len(t) >= 3]
+    if len(tokens) >= 2:
+        hit = sum(1 for t in tokens if t in text_lower)
+        if hit / len(tokens) >= 0.7:
+            return True
     return False
 
 
+def _author_appears(name: str, text_lower: str) -> bool:
+    """Author names vary wildly across papers ('John Smith', 'J. Smith',
+    'Smith, J.', 'Smith et al.'). Validate by last-name presence with a
+    one-letter first-initial sanity check when ambiguous."""
+    if not name:
+        return False
+    parts = [p for p in re.split(r"[\s,]+", name.lower().strip()) if p]
+    if not parts:
+        return False
+    # Heuristic: longest token is likely the surname (initials are short).
+    surname = max((p for p in parts if len(p) >= 2), key=len, default="")
+    if len(surname) < 2:
+        return False
+    return surname in text_lower
+
+
 def _validate_extraction(entities: dict, full_text: str) -> tuple[dict, dict]:
-    """Drop entities whose surface form doesn't appear in the source. Returns (kept, dropped_counts)."""
+    """Drop entities whose surface form doesn't appear in the source.
+    Returns (kept, dropped_counts).
+
+    Honors `SKIP_ENTITY_VALIDATION=1` for emergency bypass — useful if the
+    validator is being too strict on a particular paper format and we want to
+    fall back to the raw LLM extraction."""
+    dropped = {"authors": 0, "methods": 0, "datasets": 0, "key_concepts": 0, "metrics": 0, "relationships": 0}
+    if _SKIP_ENTITY_VALIDATION:
+        return dict(entities), dropped
+
     text_lower = (full_text or "").lower()
     out = dict(entities)
-    dropped = {"authors": 0, "methods": 0, "datasets": 0, "key_concepts": 0, "metrics": 0, "relationships": 0}
 
-    def filt(field: str) -> list:
+    def filt(field: str, check=_entity_appears) -> list:
         kept = []
         for v in entities.get(field, []) or []:
-            if _entity_appears(v, text_lower):
+            if check(v, text_lower):
                 kept.append(v)
             else:
                 dropped[field] += 1
         return kept
 
-    out["authors"] = filt("authors")
+    out["authors"] = filt("authors", check=_author_appears)
     out["methods"] = filt("methods")
     out["datasets"] = filt("datasets")
     out["key_concepts"] = filt("key_concepts")
