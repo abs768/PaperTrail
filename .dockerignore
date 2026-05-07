@@ -1,0 +1,9 @@
+venv/
+**/node_modules/
+**/dist/
+uploads/
+*.pdf
+*.docx
+__pycache__/
+.git/
+.claude/
