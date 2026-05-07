@@ -31,9 +31,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-UPLOAD_DIR = "./uploads"
+import pickle
+import pathlib
+import re
+
+# Persistent storage path. HF Spaces persistent storage is /data; fall back to ./state locally.
+_STATE_CANDIDATES = [pathlib.Path(p) for p in [os.getenv("STATE_DIR", ""), "/data", "./state"] if p]
+STATE_DIR = next((p for p in _STATE_CANDIDATES if p.parent.exists() and os.access(p.parent, os.W_OK)), pathlib.Path("./state"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = STATE_DIR / "state.pkl"
+CHROMA_DIR = STATE_DIR / "chroma"
+UPLOAD_DIR = str(STATE_DIR / "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+logger.info(f"State directory: {STATE_DIR}")
 
 # ── Initialize ────────────────────────────────────────────────────────────────
 app = FastAPI(title="PaperTrail API", version="2.0.0")
@@ -45,11 +55,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Knowledge Graph (in-memory)
+# Knowledge Graph (in-memory, persisted via pickle)
 kg = nx.DiGraph()
+papers_db: dict = {}
 
-# ChromaDB (local)
-chroma_client = chromadb.Client()
+# ChromaDB (persistent)
+chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
 ef = embedding_functions.DefaultEmbeddingFunction()
 collection = chroma_client.get_or_create_collection(
     name="papertrail_chunks",
@@ -58,6 +69,32 @@ collection = chroma_client.get_or_create_collection(
 )
 
 
+def save_state():
+    """Persist knowledge graph + paper metadata to disk."""
+    try:
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump({"kg": kg, "papers_db": papers_db}, f)
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
+
+
+def load_state():
+    """Load knowledge graph + paper metadata from disk if present."""
+    global kg, papers_db
+    if not STATE_FILE.exists():
+        return
+    try:
+        with open(STATE_FILE, "rb") as f:
+            data = pickle.load(f)
+            kg = data.get("kg", nx.DiGraph())
+            papers_db = data.get("papers_db", {})
+        logger.info(f"Restored state: {len(papers_db)} papers, {len(kg.nodes)} graph nodes, {collection.count()} chunks")
+    except Exception as e:
+        logger.error(f"Failed to load state: {e}")
+
+
+load_state()
+
 
 # LLM client — Groq (OpenAI-compatible API), with optional Gemini fallback
 _GROQ_KEY = os.getenv("GROQ_API_KEY")
@@ -65,38 +102,18 @@ _GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 if _GROQ_KEY:
     client = OpenAI(api_key=_GROQ_KEY, base_url="https://api.groq.com/openai/v1")
-    MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    _DEFAULT_MODEL = "llama-3.3-70b-versatile"
 elif _GEMINI_KEY:
     client = OpenAI(api_key=_GEMINI_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
-    MODEL = "gemini-2.5-flash"
+    _DEFAULT_MODEL = "gemini-2.5-flash"
 else:
     client = None
-    MODEL = ""
+    _DEFAULT_MODEL = ""
 
-# ── Structured output helper (json_object mode, model-agnostic) ──────────────
-def _parse_structured(messages: list, response_model):
-    """Call chat completion in json_object mode and parse into a Pydantic model.
-
-    Works on any OpenAI-compatible provider that supports JSON mode (Groq, OpenAI,
-    Gemini, etc.) — does not require the json_schema response format.
-    """
-    schema = response_model.model_json_schema()
-    primer = {
-        "role": "system",
-        "content": (
-            "Return ONLY a JSON object that conforms to this JSON Schema. "
-            "Do not include markdown fences or any prose outside the JSON.\n\n"
-            f"Schema:\n{json.dumps(schema)}"
-        ),
-    }
-    completion = _api_call_with_retry(
-        client.chat.completions.create,
-        model=MODEL,
-        messages=[primer, *messages],
-        response_format={"type": "json_object"},
-    )
-    content = completion.choices[0].message.content or "{}"
-    return response_model.model_validate_json(content)
+# Two model lanes: a fast cheap one for classification/extraction, a strong one for synthesis.
+MODEL_FAST    = os.getenv("LLM_MODEL_FAST",    os.getenv("GROQ_MODEL", _DEFAULT_MODEL))
+MODEL_QUALITY = os.getenv("LLM_MODEL_QUALITY", os.getenv("GROQ_MODEL", _DEFAULT_MODEL))
+MODEL = MODEL_QUALITY  # back-compat alias
 
 
 # ── Rate-limit retry helper ────────────────────────────────────────────────────
@@ -116,8 +133,69 @@ def _api_call_with_retry(fn, *args, max_retries: int = 4, **kwargs):
             raise
     raise RuntimeError("Max retries exceeded")
 
-# Paper metadata store
-papers_db: dict = {}
+
+# ── Structured output helper (json_object mode, model-agnostic) ──────────────
+def _extract_json_object(text: str) -> str:
+    """Best-effort extraction of a JSON object from a raw LLM response."""
+    if not text:
+        return "{}"
+    # Strip markdown fences
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        return fenced.group(1)
+    # Take the largest balanced {...} substring
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _parse_structured(messages: list, response_model, model: str = None):
+    """Call chat completion in json_object mode and parse into a Pydantic model.
+
+    Tries `response_format=json_object` first; if that fails (e.g. the model
+    emitted preamble or the provider rejects the output), retries without the
+    format constraint and salvages the JSON object from the response.
+    """
+    schema = response_model.model_json_schema()
+    primer = {
+        "role": "system",
+        "content": (
+            "You MUST return exactly one JSON object that conforms to this JSON Schema. "
+            "Output the JSON object and NOTHING else — no prose, no markdown fences, "
+            "no commentary before or after. Start the response with `{` and end with `}`.\n\n"
+            f"Schema:\n{json.dumps(schema)}"
+        ),
+    }
+    msgs = [primer, *messages]
+    target_model = model or MODEL_QUALITY
+
+    # Attempt 1: strict json_object mode
+    try:
+        completion = _api_call_with_retry(
+            client.chat.completions.create,
+            model=target_model,
+            messages=msgs,
+            response_format={"type": "json_object"},
+        )
+        content = completion.choices[0].message.content or "{}"
+        return response_model.model_validate_json(content)
+    except Exception as e:
+        err = str(e).lower()
+        # Bubble rate limits straight up; only fall through on JSON-validation errors.
+        if any(k in err for k in ("429", "rate limit", "quota", "resource_exhausted")):
+            raise
+        logger.warning(f"Strict JSON mode failed ({e.__class__.__name__}); retrying with salvage parse")
+
+    # Attempt 2: free-form, then salvage JSON
+    completion = _api_call_with_retry(
+        client.chat.completions.create,
+        model=target_model,
+        messages=msgs,
+    )
+    raw = completion.choices[0].message.content or "{}"
+    return response_model.model_validate_json(_extract_json_object(raw))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -171,8 +249,9 @@ class QueryClassification(BaseModel):
 
 
 class CitedSource(BaseModel):
-    paper_title: str = Field(description="Title of the source paper")
+    paper_title: str = Field(description="Title of the source paper — MUST exactly match a paper in the supplied context")
     relevant_detail: str = Field(description="Specific detail used from this paper")
+    page: Optional[int] = Field(default=None, description="Page number where the detail was found, if known")
 
 
 class QueryAnswer(BaseModel):
@@ -247,21 +326,29 @@ tools = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def search_vector_store(query: str, top_k: int = 5) -> str:
-    """Search ChromaDB for relevant chunks."""
+def search_vector_store(query: str, top_k: int = 5, paper_ids: list = None) -> str:
+    """Search ChromaDB for relevant chunks. Optionally restrict to specific paper IDs."""
     if collection.count() == 0:
         return json.dumps({"results": [], "message": "No papers indexed yet."})
 
-    results = collection.query(
-        query_texts=[query], n_results=min(top_k, collection.count())
-    )
+    where = None
+    if paper_ids:
+        where = {"paper_id": {"$in": list(paper_ids)}} if len(paper_ids) > 1 else {"paper_id": paper_ids[0]}
+
+    kwargs = {"query_texts": [query], "n_results": min(top_k, collection.count())}
+    if where:
+        kwargs["where"] = where
+
+    results = collection.query(**kwargs)
 
     matches = []
     for i in range(len(results["documents"][0])):
+        meta = results["metadatas"][0][i] or {}
         matches.append(
             {
                 "text": results["documents"][0][i][:600],
-                "paper_title": results["metadatas"][0][i].get("title", "Unknown"),
+                "paper_title": meta.get("title", "Unknown"),
+                "page": meta.get("page"),
                 "distance": round(results["distances"][0][i], 4)
                 if results.get("distances")
                 else None,
@@ -390,6 +477,20 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
     return chunks
 
 
+def chunk_pages(pages: list[dict], chunk_size: int = 500, overlap: int = 100) -> list[dict]:
+    """Chunk per-page so we can keep page-level provenance on every chunk."""
+    out = []
+    for p in pages:
+        words = p["text"].split()
+        if not words:
+            continue
+        for i in range(0, len(words), chunk_size - overlap):
+            text = " ".join(words[i : i + chunk_size])
+            if text:
+                out.append({"text": text, "page": p["page"]})
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTITY EXTRACTION (Structured Outputs)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -406,6 +507,10 @@ def extract_entities(text: str) -> dict:
 
     try:
         logger.info("Extracting entities via structured JSON output...")
+        # Two-pass extraction over the whole paper, not just the abstract.
+        head = text[:6000]
+        tail = text[-6000:] if len(text) > 12000 else ""
+        body = head if not tail else f"{head}\n\n[…middle elided…]\n\n{tail}"
         result = _parse_structured(
             messages=[
                 {
@@ -420,10 +525,11 @@ def extract_entities(text: str) -> dict:
                 },
                 {
                     "role": "user",
-                    "content": f"Extract all entities and relationships from this research paper text:\n\n{text[:6000]}",
+                    "content": f"Extract all entities and relationships from this research paper text:\n\n{body}",
                 },
             ],
             response_model=PaperEntities,
+            model=MODEL_FAST,
         )
         logger.info(
             f"Extraction complete — {len(result.authors)} authors, {len(result.methods)} methods, "
@@ -504,16 +610,26 @@ def add_to_knowledge_graph(paper_id: str, entities: dict):
     logger.info(f"Graph updated — now {len(kg.nodes)} nodes, {len(kg.edges)} edges")
 
 
-def add_to_vector_store(paper_id: str, chunks: list[str], metadata: dict):
+def add_to_vector_store(paper_id: str, chunks, metadata: dict):
+    """Accepts either list[str] (legacy) or list[{text, page}] (with provenance)."""
     if not chunks:
         return
-    ids = [f"{paper_id}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [
-        {"paper_id": paper_id, "title": metadata.get("title", "Unknown"), "chunk_index": i}
-        for i in range(len(chunks))
-    ]
-    collection.add(documents=chunks, ids=ids, metadatas=metadatas)
-    logger.info(f"Added {len(chunks)} chunks to vector store")
+    docs, metas, ids = [], [], []
+    for i, c in enumerate(chunks):
+        if isinstance(c, dict):
+            text = c["text"]
+            page = c.get("page")
+        else:
+            text = c
+            page = None
+        ids.append(f"{paper_id}_chunk_{i}")
+        docs.append(text)
+        meta = {"paper_id": paper_id, "title": metadata.get("title", "Unknown"), "chunk_index": i}
+        if page is not None:
+            meta["page"] = page
+        metas.append(meta)
+    collection.add(documents=docs, ids=ids, metadatas=metas)
+    logger.info(f"Added {len(docs)} chunks to vector store")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -521,38 +637,83 @@ def add_to_vector_store(paper_id: str, chunks: list[str], metadata: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _papers_in_subgraph(subgraph_json: str) -> list[str]:
+    """Extract paper_ids from a traverse_knowledge_graph JSON result."""
+    try:
+        data = json.loads(subgraph_json)
+    except Exception:
+        return []
+    paper_ids = set()
+    for entry in data.get("results", []):
+        nid = entry.get("id", "")
+        if nid.startswith("paper:"):
+            paper_ids.add(nid)
+        for c in entry.get("connections", []):
+            # Connections aren't tagged with id; we only know the name. Skip.
+            pass
+    # Also: any paper whose title matches an entity name
+    return list(paper_ids)
+
+
+def _filter_hallucinated_sources(sources: list, library_titles: list[str]) -> tuple[list, list]:
+    """Drop sources whose paper_title doesn't fuzzy-match any indexed paper.
+
+    Returns (kept, dropped) where dropped is a list of {paper_title, reason}.
+    """
+    kept, dropped = [], []
+    library_lower = [(t or "").lower() for t in library_titles]
+    for s in sources:
+        cited = (s.get("paper_title") or "").lower().strip()
+        if not cited:
+            dropped.append({"paper_title": s.get("paper_title"), "reason": "empty title"})
+            continue
+        match = any(
+            cited == lt
+            or (cited and lt and (cited in lt or lt in cited))
+            or (cited and lt and len(cited) > 8 and len(lt) > 8 and (cited[:20] in lt or lt[:20] in cited))
+            for lt in library_lower
+        )
+        if match:
+            kept.append(s)
+        else:
+            dropped.append({"paper_title": s.get("paper_title"), "reason": "not in library"})
+    return kept, dropped
+
+
 def graphrag_query(question: str, top_k: int = 5) -> dict:
     """
-    GraphRAG query pipeline:
-    1. Classify query (structured output) → determines search strategy
-    2. GPT-4o calls tools autonomously (function calling) → vector search + graph traversal
-    3. Synthesize cited answer (structured output)
+    GraphRAG query pipeline (deterministic, graph-driven):
+      1. Classify query → query_type, key_entities, search_strategy
+      2. Pre-retrieve graph subgraph + vector chunks based on classification
+         - For comparative/relational queries, vector search is restricted to
+           papers found in the graph subgraph
+      3. Single structured-output call generates an answer that MUST cite only
+         the supplied context (no training-data leakage)
+      4. Post-filter: drop any cited paper that isn't actually in the library
     """
     if not client:
         vector_results = json.loads(search_vector_store(question, top_k))
         return {
-            "answer": "OpenAI API key not configured. Raw search results returned.",
+            "answer": "LLM API key not configured. Raw search results returned.",
             "sources": [],
             "passages": vector_results.get("results", []),
             "confidence": 0.0,
             "follow_up_questions": [],
         }
 
-    # ── Step 1: Classify query (Structured Output pattern) ────────────────
+    # ── Step 1: Classify ────────────────────────────────────────────────
     logger.info(f"Classifying query: {question}")
     try:
         query_info = _parse_structured(
             messages=[
-                {
-                    "role": "system",
-                    "content": "Classify this research question to determine the best search strategy.",
-                },
+                {"role": "system", "content": "Classify this research question to determine the best search strategy."},
                 {"role": "user", "content": question},
             ],
             response_model=QueryClassification,
+            model=MODEL_FAST,
         )
         logger.info(
-            f"Query classified — type: {query_info.query_type}, "
+            f"Classified — type: {query_info.query_type}, "
             f"strategy: {query_info.search_strategy}, "
             f"entities: {query_info.key_entities}"
         )
@@ -560,122 +721,89 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
         logger.error(f"Classification failed: {e}")
         query_info = None
 
-    # ── Step 2: Function calling loop ─────────────────────────────────────
-    logger.info("Starting function calling loop...")
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are PaperTrail, a research memory assistant. "
-                "You have access to a knowledge graph and vector store of the user's research papers. "
-                "Use the available tools to find relevant information, then answer the question. "
-                "Always search both the vector store and knowledge graph for comprehensive results. "
-                "Cite specific papers in your answer."
-            ),
-        },
-    ]
+    qtype = (query_info.query_type if query_info else "exploratory").lower()
+    strategy = (query_info.search_strategy if query_info else "balanced").lower()
+    key_entities = query_info.key_entities if query_info else []
 
-    if query_info:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    f"Query analysis — Type: {query_info.query_type}, "
-                    f"Strategy: {query_info.search_strategy}, "
-                    f"Key entities: {', '.join(query_info.key_entities)}"
-                ),
-            }
-        )
+    use_graph = (
+        qtype in ("comparative", "relational")
+        or strategy in ("graph_heavy", "balanced")
+        or len(papers_db) > 1
+    )
 
-    messages.append({"role": "user", "content": question})
+    # ── Step 2: Deterministic retrieval ─────────────────────────────────
+    graph_context = ""
+    paper_ids_in_subgraph = []
+    if use_graph and key_entities and len(kg.nodes) > 0:
+        graph_raw = traverse_knowledge_graph(key_entities, hops=2)
+        paper_ids_in_subgraph = _papers_in_subgraph(graph_raw)
+        graph_context = f"KNOWLEDGE GRAPH SUBGRAPH (entities + relationships from your library):\n{graph_raw}"
 
-    choice = None
-    try:
-        for iteration in range(5):
-            completion = _api_call_with_retry(
-                client.chat.completions.create,
-                model=MODEL,
-                messages=messages,
-                tools=tools,
-            )
+    # For comparative queries, restrict vector search to papers found in the subgraph.
+    restrict_to = paper_ids_in_subgraph if (qtype in ("comparative", "relational") and paper_ids_in_subgraph) else None
+    vector_raw = search_vector_store(question, top_k=top_k, paper_ids=restrict_to)
+    vector_context = f"VECTOR PASSAGES{f' (restricted to {len(restrict_to)} papers from subgraph)' if restrict_to else ''}:\n{vector_raw}"
 
-            choice = completion.choices[0]
+    library_titles = [p.get("title", "") for p in papers_db.values()]
+    library_listing = "\n".join(f"- {t}" for t in library_titles) or "(empty)"
 
-            if choice.message.tool_calls:
-                messages.append(choice.message)
-                for tool_call in choice.message.tool_calls:
-                    name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
-                    logger.info(f"Tool call [{iteration+1}]: {name}({json.dumps(args)[:100]})")
-
-                    result = call_tool(name, args)
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tool_call.id, "content": result}
-                    )
-            else:
-                break
-    except Exception as e:
-        logger.error(f"Function calling loop failed: {e}")
-        err_str = str(e).lower()
-        if any(k in err_str for k in ("429", "rate limit", "quota", "resource_exhausted")):
-            return {
-                "answer": "The AI API is currently rate limited. Please wait a moment and try again.",
-                "sources": [],
-                "confidence": 0.0,
-                "follow_up_questions": [],
-                "error": "rate_limited",
-            }
-        return {
-            "answer": f"Query failed due to an API error: {e}",
-            "sources": [],
-            "confidence": 0.0,
-            "follow_up_questions": [],
-        }
-
-    # ── Step 3: Generate structured answer (Structured Output pattern) ────
+    # ── Step 3: Generate cited answer ───────────────────────────────────
     logger.info("Generating structured answer...")
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                "Now provide your final answer as a structured response. "
-                "CRITICAL: If the user's original prompt asked you to write code, "
-                "you MUST write the complete, un-summarized code block inside the 'answer' field. "
-                "Do not skip the code. Include citations, confidence score, and follow-up questions."
-            ),
-        }
+    sys_prompt = (
+        "You are PaperTrail, a research memory assistant. "
+        "Answer the user's question using ONLY the supplied KNOWLEDGE GRAPH SUBGRAPH and VECTOR PASSAGES below. "
+        "DO NOT cite any paper that is not in the user's library listing. "
+        "If the supplied context is insufficient, say so plainly — do not fall back to your training data. "
+        "When citing, the paper_title field MUST exactly match a title from the user's library listing. "
+        "Include a page number on every CitedSource when the source passage has one."
+    )
+    user_prompt = (
+        f"User's library ({len(library_titles)} papers):\n{library_listing}\n\n"
+        f"{graph_context}\n\n{vector_context}\n\n"
+        f"Question: {question}\n\n"
+        f"Provide a clear, comprehensive answer grounded strictly in the context above. "
+        f"Cite each claim with the exact paper_title from the library listing and the page number when available."
     )
 
     try:
-        final = _parse_structured(messages=messages, response_model=QueryAnswer)
-        logger.info(f"Answer generated — confidence: {final.confidence}, sources: {len(final.sources)}")
+        final = _parse_structured(
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_model=QueryAnswer,
+            model=MODEL_QUALITY,
+        )
 
+        sources = [s.model_dump() for s in final.sources]
+        kept, dropped = _filter_hallucinated_sources(sources, library_titles)
+        if dropped:
+            logger.warning(f"Dropped {len(dropped)} hallucinated source(s): {[d['paper_title'] for d in dropped]}")
+
+        logger.info(f"Answer generated — confidence: {final.confidence}, sources kept: {len(kept)}, dropped: {len(dropped)}")
         return {
             "answer": final.answer,
-            "sources": [s.model_dump() for s in final.sources],
+            "sources": kept,
+            "dropped_sources": dropped,
             "confidence": final.confidence,
             "follow_up_questions": final.follow_up_questions,
-            "query_type": query_info.query_type if query_info else "unknown",
-            "search_strategy": query_info.search_strategy if query_info else "unknown",
+            "query_type": qtype,
+            "search_strategy": strategy,
+            "graph_used": bool(restrict_to),
+            "papers_in_subgraph": len(paper_ids_in_subgraph),
         }
-
     except Exception as e:
         logger.error(f"Structured answer failed: {e}")
         err_str = str(e).lower()
         if any(k in err_str for k in ("429", "rate limit", "quota", "resource_exhausted")):
             return {
                 "answer": "The AI API is currently rate limited. Please wait a moment and try again.",
-                "sources": [],
-                "confidence": 0.0,
-                "follow_up_questions": [],
+                "sources": [], "confidence": 0.0, "follow_up_questions": [],
                 "error": "rate_limited",
             }
-        raw_answer = (choice.message.content if choice and choice.message else None) or "Could not generate answer."
         return {
-            "answer": raw_answer,
-            "sources": [],
-            "confidence": 0.5,
-            "follow_up_questions": [],
+            "answer": f"Query failed: {e}",
+            "sources": [], "confidence": 0.0, "follow_up_questions": [],
         }
 
 
@@ -704,19 +832,13 @@ def health():
     return {"status": "ok", "service": "PaperTrail API", "version": "2.0.0"}
 
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported")
-
-    file_bytes = await file.read()
+def _ingest_pdf_bytes(file_bytes: bytes, source_label: str) -> dict:
+    """Index a PDF from raw bytes. `source_label` is the filename or URL."""
     file_hash = hashlib.md5(file_bytes).hexdigest()[:12]
     paper_id = f"paper:{file_hash}"
 
     if paper_id in papers_db:
-        return JSONResponse(
-            {"message": "Paper already indexed", "paper_id": paper_id, "title": papers_db[paper_id]["title"]}
-        )
+        return {"message": "Paper already indexed", "paper_id": paper_id, "title": papers_db[paper_id]["title"], "duplicate": True}
 
     file_path = os.path.join(UPLOAD_DIR, f"{file_hash}.pdf")
     with open(file_path, "wb") as f:
@@ -732,31 +854,34 @@ async def upload_pdf(file: UploadFile = File(...)):
     except Exception as e:
         err = str(e).lower()
         if any(k in err for k in ("429", "rate limit", "quota", "resource_exhausted")):
-            raise HTTPException(429, "AI API rate limited — paper text extracted but entity extraction skipped. Try again shortly.")
+            raise HTTPException(429, "AI API rate limited — try again in a moment.")
         raise HTTPException(500, f"Entity extraction failed: {e}")
-    title = entities.get("title") or file.filename.replace(".pdf", "")
+
+    fallback_title = source_label.rsplit("/", 1)[-1].replace(".pdf", "")
+    title = entities.get("title") or fallback_title
     entities["title"] = title
 
     add_to_knowledge_graph(paper_id, entities)
 
-    chunks = chunk_text(full_text)
-    add_to_vector_store(paper_id, chunks, {"title": title})
+    page_chunks = chunk_pages(pages)
+    add_to_vector_store(paper_id, page_chunks, {"title": title})
 
     papers_db[paper_id] = {
         "title": title,
-        "filename": file.filename,
+        "filename": source_label,
         "pages": len(pages),
-        "chunks": len(chunks),
+        "chunks": len(page_chunks),
         "entities": entities,
         "uploaded_at": datetime.now().isoformat(),
     }
+    save_state()
 
     return {
         "message": "Paper indexed successfully",
         "paper_id": paper_id,
         "title": title,
         "pages": len(pages),
-        "chunks": len(chunks),
+        "chunks": len(page_chunks),
         "entities_found": {
             "authors": len(entities.get("authors", [])),
             "methods": len(entities.get("methods", [])),
@@ -772,6 +897,49 @@ async def upload_pdf(file: UploadFile = File(...)):
             "key_concepts": entities.get("key_concepts", [])[:6],
         },
     }
+
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported")
+    file_bytes = await file.read()
+    return _ingest_pdf_bytes(file_bytes, file.filename)
+
+
+def _normalize_paper_url(url: str) -> str:
+    """Turn arXiv abs URLs into PDF URLs; pass through everything else."""
+    url = url.strip()
+    m = re.match(r"https?://(?:www\.)?arxiv\.org/abs/([^?#\s]+)", url)
+    if m:
+        return f"https://arxiv.org/pdf/{m.group(1)}.pdf"
+    if "arxiv.org/pdf/" in url and not url.lower().endswith(".pdf"):
+        return url + ".pdf"
+    return url
+
+
+class UrlUploadRequest(BaseModel):
+    url: str
+
+
+@app.post("/upload-url")
+async def upload_pdf_from_url(req: UrlUploadRequest):
+    import httpx
+    url = _normalize_paper_url(req.url)
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as h:
+            resp = await h.get(url, headers={"User-Agent": "PaperTrail/1.0 (research memory agent)"})
+            if resp.status_code != 200:
+                raise HTTPException(400, f"Could not fetch URL ({resp.status_code})")
+            ct = resp.headers.get("content-type", "")
+            if "pdf" not in ct.lower() and not url.lower().endswith(".pdf"):
+                raise HTTPException(400, f"URL did not return a PDF (content-type: {ct})")
+            file_bytes = resp.content
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Fetch failed: {e}")
+    return _ingest_pdf_bytes(file_bytes, url)
 
 
 @app.post("/note")
@@ -790,6 +958,7 @@ async def add_note(note: NoteRequest):
         "entities": entities,
         "uploaded_at": datetime.now().isoformat(),
     }
+    save_state()
     return {"message": "Note added", "note_id": note_id, "title": note.title}
 
 
@@ -854,17 +1023,42 @@ def get_stats():
     }
 
 
+@app.delete("/papers/{paper_id:path}")
+def delete_paper(paper_id: str):
+    paper_id = paper_id.replace("%3A", ":")
+    if paper_id not in papers_db:
+        raise HTTPException(404, "Paper not found")
+    # Drop chunks
+    try:
+        collection.delete(where={"paper_id": paper_id})
+    except Exception as e:
+        logger.warning(f"Chroma delete failed for {paper_id}: {e}")
+    # Drop graph nodes that are exclusive to this paper (the paper node and any orphans)
+    if kg.has_node(paper_id):
+        kg.remove_node(paper_id)
+    orphans = [n for n in list(kg.nodes) if kg.degree(n) == 0]
+    for n in orphans:
+        kg.remove_node(n)
+    papers_db.pop(paper_id, None)
+    save_state()
+    return {"message": "Paper deleted", "paper_id": paper_id}
+
+
 @app.delete("/reset")
 def reset_system():
     global kg, papers_db, collection
     kg = nx.DiGraph()
     papers_db = {}
-    chroma_client.delete_collection("papertrail_chunks")
+    try:
+        chroma_client.delete_collection("papertrail_chunks")
+    except Exception:
+        pass
     collection = chroma_client.get_or_create_collection(
         name="papertrail_chunks",
         embedding_function=ef,
         metadata={"hnsw:space": "cosine"},
     )
+    save_state()
     return {"message": "System reset complete"}
 
 

@@ -1,4 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import cytoscape from "cytoscape";
+import fcose from "cytoscape-fcose";
+
+cytoscape.use(fcose);
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
@@ -157,187 +161,198 @@ function ExtractionCard({ result }) {
   );
 }
 
-/* ── Force Graph ────────────────────────────────────────────────────────────── */
-function ForceGraph({ graphData }) {
+/* ── Cytoscape Graph ────────────────────────────────────────────────────────── */
+function CytoscapeGraph({ graphData }) {
   const containerRef = useRef(null);
-  const canvasRef    = useRef(null);
-  const nodesRef     = useRef([]);
-  const edgesRef     = useRef([]);
-  const dragRef      = useRef(null);
-  const hoveredRef   = useRef(null);
-  const offsetRef    = useRef({x:0,y:0});
-  const animRef      = useRef(null);
+  const cyRef        = useRef(null);
   const [tooltip, setTooltip]  = useState(null);
-  const [dims, setDims]        = useState({width:800,height:520});
   const [visibleTypes, setVis] = useState(DEFAULT_VISIBLE);
 
-  useEffect(()=>{
-    if (!containerRef.current) return;
-    const obs = new ResizeObserver(entries => {
-      const w = Math.floor(entries[0].contentRect.width);
-      if (w>0) setDims({width:w, height:Math.max(480,Math.floor(w*0.56))});
+  useEffect(() => {
+    if (!containerRef.current || !graphData?.nodes?.length) return;
+
+    const visibleNodeIds = new Set(graphData.nodes.filter(n => visibleTypes.has(n.type)).map(n => n.id));
+    const elements = [
+      ...graphData.nodes
+        .filter(n => visibleNodeIds.has(n.id))
+        .map(n => ({
+          data: {
+            id: n.id,
+            label: n.label || n.id,
+            type: n.type,
+            color: NODE_COLORS[n.type] || "#94a3b8",
+            size: NODE_SIZES[n.type] || 18,
+          },
+        })),
+      ...graphData.edges
+        .filter(e => visibleNodeIds.has(e.source) && visibleNodeIds.has(e.target))
+        .map((e, i) => ({
+          data: {
+            id: `e${i}`,
+            source: e.source,
+            target: e.target,
+            label: e.relation || "",
+          },
+        })),
+    ];
+
+    if (cyRef.current) cyRef.current.destroy();
+
+    const cy = cytoscape({
+      container: containerRef.current,
+      elements,
+      wheelSensitivity: 0.25,
+      minZoom: 0.2,
+      maxZoom: 3,
+      style: [
+        {
+          selector: "node",
+          style: {
+            "background-color": "data(color)",
+            "border-color": "data(color)",
+            "border-width": 1.5,
+            "border-opacity": 0.7,
+            label: ele => {
+              const t = ele.data("type");
+              const lbl = ele.data("label") || "";
+              if (t === "paper" || t === "author" || t === "note") {
+                return lbl.length > 26 ? lbl.slice(0, 26) + "…" : lbl;
+              }
+              return lbl.length > 18 ? lbl.slice(0, 18) + "…" : lbl;
+            },
+            color: "#dbe4f5",
+            "font-size": 11,
+            "font-family": "Inter, system-ui, sans-serif",
+            "text-valign": "bottom",
+            "text-halign": "center",
+            "text-margin-y": 6,
+            "text-background-color": "rgba(7,11,20,0.85)",
+            "text-background-opacity": 1,
+            "text-background-padding": 3,
+            "text-background-shape": "round-rectangle",
+            "text-border-color": "rgba(26,40,68,0.6)",
+            "text-border-opacity": 1,
+            "text-border-width": 0.5,
+            width: "data(size)",
+            height: "data(size)",
+            "overlay-opacity": 0,
+          },
+        },
+        {
+          selector: "node[type='paper']",
+          style: { "border-width": 2.5, "font-weight": 700, color: "#f1d28a" },
+        },
+        {
+          selector: "edge",
+          style: {
+            width: 1,
+            "line-color": "rgba(26,40,68,0.85)",
+            "target-arrow-color": "rgba(26,40,68,0.85)",
+            "target-arrow-shape": "triangle",
+            "arrow-scale": 0.9,
+            "curve-style": "bezier",
+            "control-point-step-size": 25,
+            opacity: 0.65,
+          },
+        },
+        {
+          selector: "node:selected",
+          style: {
+            "border-width": 3,
+            "border-color": "#e8a838",
+            "border-opacity": 1,
+          },
+        },
+        {
+          selector: "edge.highlight",
+          style: {
+            "line-color": "rgba(232,168,56,0.85)",
+            "target-arrow-color": "rgba(232,168,56,0.85)",
+            width: 2,
+            opacity: 1,
+            label: "data(label)",
+            "font-size": 10,
+            "text-background-color": "rgba(7,11,20,0.95)",
+            "text-background-opacity": 1,
+            "text-background-padding": 3,
+            "text-rotation": "autorotate",
+            color: "#94a3b8",
+          },
+        },
+      ],
+      layout: {
+        name: "fcose",
+        animate: true,
+        animationDuration: 600,
+        randomize: true,
+        idealEdgeLength: 110,
+        nodeRepulsion: 6000,
+        nodeSeparation: 75,
+        gravity: 0.25,
+        padding: 30,
+      },
     });
-    obs.observe(containerRef.current);
-    return () => obs.disconnect();
-  },[]);
 
-  const {width,height} = dims;
+    cy.on("mouseover", "node", evt => {
+      const n = evt.target;
+      n.connectedEdges().addClass("highlight");
+      const pos = n.renderedPosition();
+      const r = containerRef.current.getBoundingClientRect();
+      setTooltip({
+        x: r.left + pos.x,
+        y: r.top + pos.y - 30,
+        text: `${n.data("type")}: ${n.data("label")}`,
+      });
+    });
+    cy.on("mouseout", "node", evt => {
+      evt.target.connectedEdges().removeClass("highlight");
+      setTooltip(null);
+    });
 
-  useEffect(()=>{
-    if (!graphData?.nodes.length) return;
-    if (animRef.current) cancelAnimationFrame(animRef.current);
+    cyRef.current = cy;
+    return () => { cy.destroy(); cyRef.current = null; };
+  }, [graphData, visibleTypes]);
 
-    const visIds = new Set(graphData.nodes.filter(n=>visibleTypes.has(n.type)).map(n=>n.id));
-    const fNodes = graphData.nodes.filter(n=>visIds.has(n.id));
-    const fEdges = graphData.edges.filter(e=>visIds.has(e.source)&&visIds.has(e.target));
-    const papers = fNodes.filter(n=>n.type==="paper");
-    const others = fNodes.filter(n=>n.type!=="paper");
+  const typeCounts = {};
+  graphData?.nodes.forEach(n => { typeCounts[n.type] = (typeCounts[n.type] || 0) + 1; });
+  const visibleCount = graphData?.nodes.filter(n => visibleTypes.has(n.type)).length || 0;
 
-    const nodes = [
-      ...papers.map((n,i)=>{
-        const a=(i/Math.max(papers.length,1))*Math.PI*2-Math.PI/2, r=Math.min(130,papers.length*50);
-        return {...n, x:width/2+Math.cos(a)*r, y:height/2+Math.sin(a)*r, vx:0, vy:0};
-      }),
-      ...others.map(n=>({...n, x:width/2+(Math.random()-.5)*width*.75, y:height/2+(Math.random()-.5)*height*.75, vx:0, vy:0})),
-    ].map(n=>({...n, radius:NODE_SIZES[n.type]||18, color:NODE_COLORS[n.type]||"#94a3b8"}));
-
-    const nodeMap={}; nodes.forEach(n=>nodeMap[n.id]=n);
-    const edges = fEdges
-      .filter(e=>nodeMap[e.source]&&nodeMap[e.target])
-      .map(e=>({...e, sourceNode:nodeMap[e.source], targetNode:nodeMap[e.target]}));
-
-    nodesRef.current=nodes; edgesRef.current=edges;
-    let iter=0; const MAX=450;
-
-    function arrow(ctx,x1,y1,x2,y2,r) {
-      const dx=x2-x1, dy=y2-y1, len=Math.sqrt(dx*dx+dy*dy)||1, ux=dx/len, uy=dy/len;
-      const tx=x2-ux*(r+2), ty=y2-uy*(r+2), al=7, aw=3.5;
-      ctx.beginPath(); ctx.moveTo(tx,ty);
-      ctx.lineTo(tx-ux*al+uy*aw, ty-uy*al-ux*aw);
-      ctx.lineTo(tx-ux*al-uy*aw, ty-uy*al+ux*aw);
-      ctx.closePath(); ctx.fill();
-    }
-
-    function pill(ctx,x,y,text,color) {
-      ctx.font="11px 'Inter',system-ui,sans-serif";
-      const tw=ctx.measureText(text).width, pw=tw+10, ph=17;
-      ctx.fillStyle="rgba(7,11,20,0.88)";
-      ctx.beginPath(); ctx.roundRect(x-pw/2,y-ph/2,pw,ph,4); ctx.fill();
-      ctx.fillStyle=color; ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(text,x,y);
-    }
-
-    function draw() {
-      const canvas=canvasRef.current; if(!canvas)return;
-      const ctx=canvas.getContext("2d");
-      ctx.clearRect(0,0,width,height);
-      ctx.fillStyle="rgba(26,40,68,0.2)";
-      for(let gx=28;gx<width;gx+=28) for(let gy=28;gy<height;gy+=28){ctx.beginPath();ctx.arc(gx,gy,1,0,Math.PI*2);ctx.fill();}
-
-      const hov=hoveredRef.current;
-      for (const e of edgesRef.current) {
-        const hi=hov&&(e.sourceNode===hov||e.targetNode===hov);
-        ctx.strokeStyle=hi?"rgba(232,168,56,0.65)":"rgba(26,40,68,0.75)";
-        ctx.lineWidth=hi?1.5:1;
-        ctx.beginPath(); ctx.moveTo(e.sourceNode.x,e.sourceNode.y); ctx.lineTo(e.targetNode.x,e.targetNode.y); ctx.stroke();
-        ctx.fillStyle=hi?"rgba(232,168,56,0.7)":"rgba(26,40,68,0.85)";
-        arrow(ctx,e.sourceNode.x,e.sourceNode.y,e.targetNode.x,e.targetNode.y,e.targetNode.radius);
-        if (hi&&e.relation) pill(ctx,(e.sourceNode.x+e.targetNode.x)/2,(e.sourceNode.y+e.targetNode.y)/2,e.relation,"#64748b");
-      }
-      for (const n of nodesRef.current) {
-        const isPaper=n.type==="paper", isHov=n===hov, glowR=n.radius+(isHov?11:isPaper?7:4);
-        const g=ctx.createRadialGradient(n.x,n.y,n.radius*.4,n.x,n.y,glowR);
-        g.addColorStop(0,n.color+(isHov?"60":isPaper?"40":"22")); g.addColorStop(1,"transparent");
-        ctx.beginPath(); ctx.arc(n.x,n.y,glowR,0,Math.PI*2); ctx.fillStyle=g; ctx.fill();
-        const bg=ctx.createRadialGradient(n.x-n.radius*.22,n.y-n.radius*.22,0,n.x,n.y,n.radius);
-        bg.addColorStop(0,n.color+"ff"); bg.addColorStop(1,n.color+"99");
-        ctx.beginPath(); ctx.arc(n.x,n.y,n.radius,0,Math.PI*2); ctx.fillStyle=bg; ctx.fill();
-        ctx.strokeStyle=isHov?n.color:n.color+"77"; ctx.lineWidth=isHov?2.5:isPaper?2:1.5; ctx.stroke();
-        ctx.fillStyle="rgba(255,255,255,0.92)"; ctx.font=`bold ${Math.floor(n.radius*.68)}px 'JetBrains Mono',monospace`;
-        ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText(n.type[0].toUpperCase(),n.x,n.y);
-        if (isPaper||n.type==="author"||isHov) {
-          const lbl=(n.label?.length>22)?n.label.slice(0,22)+"…":(n.label||n.id);
-          pill(ctx,n.x,n.y+n.radius+12,lbl,isPaper?"#e8a838":isHov?"#f0f4ff":"#8fa3c8");
-        }
-      }
-    }
-
-    function tick() {
-      const ns=nodesRef.current, es=edgesRef.current;
-      for(let i=0;i<ns.length;i++){
-        ns[i]._fx=0; ns[i]._fy=0;
-        for(let j=0;j<ns.length;j++){
-          if(i===j)continue;
-          const dx=ns[i].x-ns[j].x, dy=ns[i].y-ns[j].y, d2=dx*dx+dy*dy+.01, d=Math.sqrt(d2);
-          const f=4500/d2; ns[i]._fx+=(dx/d)*f; ns[i]._fy+=(dy/d)*f;
-        }
-      }
-      for(const e of es){
-        const dx=e.targetNode.x-e.sourceNode.x, dy=e.targetNode.y-e.sourceNode.y;
-        const d=Math.sqrt(dx*dx+dy*dy)||.1, f=(d-140)*.007, fx=(dx/d)*f, fy=(dy/d)*f;
-        e.sourceNode._fx+=fx; e.sourceNode._fy+=fy; e.targetNode._fx-=fx; e.targetNode._fy-=fy;
-      }
-      const cap=Math.max(.3,(1-iter/MAX)*14);
-      for(const n of ns){
-        if(n===dragRef.current)continue;
-        const f=Math.sqrt(n._fx*n._fx+n._fy*n._fy)||1, d=Math.min(f,cap);
-        n.x+=(n._fx/f)*d; n.y+=(n._fy/f)*d;
-        n.x+=(width/2-n.x)*.004; n.y+=(height/2-n.y)*.004;
-        const p=n.radius+24; n.x=Math.max(p,Math.min(width-p,n.x)); n.y=Math.max(p,Math.min(height-p,n.y));
-      }
-      draw(); iter++;
-      if(iter<MAX||dragRef.current) animRef.current=requestAnimationFrame(tick);
-    }
-    tick();
-    return ()=>{ if(animRef.current) cancelAnimationFrame(animRef.current); };
-  },[graphData,visibleTypes,width,height]);
-
-  const toCanvas = e => {
-    const r=canvasRef.current.getBoundingClientRect();
-    return {x:(e.clientX-r.left)*(width/r.width), y:(e.clientY-r.top)*(height/r.height)};
-  };
-  const hit = p => nodesRef.current.find(n=>(p.x-n.x)**2+(p.y-n.y)**2<n.radius**2)||null;
-  const onDown = e => { const n=hit(toCanvas(e)); if(n){dragRef.current=n; const p=toCanvas(e); offsetRef.current={x:p.x-n.x,y:p.y-n.y};} };
-  const onMove = e => {
-    const p=toCanvas(e);
-    if(dragRef.current){dragRef.current.x=p.x-offsetRef.current.x; dragRef.current.y=p.y-offsetRef.current.y; dragRef.current.vx=dragRef.current.vy=0;}
-    const h=hit(p); hoveredRef.current=h;
-    setTooltip(h?{x:e.clientX,y:e.clientY,text:`${h.type}: ${h.label||h.id}`}:null);
-  };
-  const onUp = () => { dragRef.current=null; };
-
-  const typeCounts={};
-  graphData?.nodes.forEach(n=>{ typeCounts[n.type]=(typeCounts[n.type]||0)+1; });
+  const fit = () => cyRef.current?.fit(undefined, 30);
+  const recenter = () => cyRef.current?.center();
 
   return (
     <div className="pt-graph-page">
       <div className="pt-graph-filters">
-        {Object.entries(NODE_COLORS).map(([type,color])=>{
-          const count=typeCounts[type]||0; if(!count)return null;
-          const on=visibleTypes.has(type);
+        {Object.entries(NODE_COLORS).map(([type, color]) => {
+          const count = typeCounts[type] || 0;
+          if (!count) return null;
+          const on = visibleTypes.has(type);
           return (
             <button key={type} className="pt-type-toggle"
-              style={{color:on?color:"var(--text-4)",background:on?color+"14":"transparent",borderColor:on?color+"55":"var(--border-2)"}}
-              onClick={()=>setVis(p=>{const n=new Set(p);n.has(type)?n.delete(type):n.add(type);return n;})}>
-              <span className="pt-type-dot" style={{background:on?color:"var(--border-3)"}}/>
+              style={{ color: on ? color : "var(--text-4)", background: on ? color + "14" : "transparent", borderColor: on ? color + "55" : "var(--border-2)" }}
+              onClick={() => setVis(p => { const n = new Set(p); n.has(type) ? n.delete(type) : n.add(type); return n; })}>
+              <span className="pt-type-dot" style={{ background: on ? color : "var(--border-3)" }} />
               {type}
-              <span style={{opacity:.5,fontFamily:"var(--font-mono)",fontSize:10}}>{count}</span>
+              <span style={{ opacity: 0.5, fontFamily: "var(--font-mono)", fontSize: 10 }}>{count}</span>
             </button>
           );
         })}
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <button className="pt-type-toggle" onClick={fit} title="Fit graph to view">⤢ Fit</button>
+          <button className="pt-type-toggle" onClick={recenter} title="Recenter">◎ Center</button>
+        </div>
       </div>
 
-      <div ref={containerRef} style={{position:"relative",borderRadius:14,overflow:"hidden",background:"var(--bg-base)",border:"1px solid var(--border-1)",boxShadow:"var(--shadow-m)"}}>
-        <canvas ref={canvasRef} width={width} height={height}
-          onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp}
-          style={{display:"block",width:"100%",height:"auto",cursor:"crosshair"}}/>
+      <div style={{ position: "relative", borderRadius: 14, overflow: "hidden", background: "var(--bg-base)", border: "1px solid var(--border-1)", boxShadow: "var(--shadow-m)" }}>
+        <div ref={containerRef} style={{ width: "100%", height: "max(520px, 60vh)" }} />
         {tooltip && (
-          <div style={{position:"fixed",left:tooltip.x+14,top:tooltip.y-10,background:"var(--bg-card)",color:"var(--text-1)",padding:"7px 12px",borderRadius:8,fontSize:12,pointerEvents:"none",border:"1px solid var(--border-2)",zIndex:999,boxShadow:"var(--shadow-m)",maxWidth:260}}>
+          <div style={{ position: "fixed", left: tooltip.x + 14, top: tooltip.y - 10, background: "var(--bg-card)", color: "var(--text-1)", padding: "7px 12px", borderRadius: 8, fontSize: 12, pointerEvents: "none", border: "1px solid var(--border-2)", zIndex: 999, boxShadow: "var(--shadow-m)", maxWidth: 260 }}>
             {tooltip.text}
           </div>
         )}
       </div>
-      <div style={{fontSize:11,color:"var(--text-4)",textAlign:"center",marginTop:4}}>
-        Drag nodes · Hover to reveal labels and edge relations · {nodesRef.current.length} nodes shown
+      <div style={{ fontSize: 11, color: "var(--text-4)", textAlign: "center", marginTop: 4 }}>
+        Drag nodes · Scroll to zoom · Hover for tooltips and edge labels · {visibleCount} nodes shown
       </div>
     </div>
   );
@@ -360,6 +375,7 @@ export default function PaperTrail() {
   const [noteStatus,   setNoteStatus]   = useState(null);
   const [globalError,  setGlobalError]  = useState(null);
   const [isDragging,   setIsDragging]   = useState(false);
+  const [pdfUrl,       setPdfUrl]       = useState("");
   const chatEndRef   = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -395,6 +411,23 @@ export default function PaperTrail() {
   const onDragOver   = e => { e.preventDefault(); setIsDragging(true); };
   const onDragLeave  = ()=> setIsDragging(false);
   const onDrop       = e => { e.preventDefault(); setIsDragging(false); processFile(e.dataTransfer.files?.[0]); };
+
+  const handleUrlUpload = async () => {
+    const u = pdfUrl.trim();
+    if (!u || uploading) return;
+    setUploading(true); setUploadResult(null); setUploadError(null);
+    try {
+      const res = await fetch(`${API_BASE}/upload-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: u }),
+      });
+      const data = await res.json();
+      if (!res.ok) setUploadError(res.status === 429 ? "Rate limited — try again in a moment." : (data.detail || "URL upload failed."));
+      else { setUploadResult(data); setPdfUrl(""); fetchData(); }
+    } catch (e) { setUploadError("URL upload failed: " + e.message); }
+    setUploading(false);
+  };
 
   const handleNote = async()=>{
     if(!noteTitle.trim()||!noteContent.trim()) return;
@@ -513,8 +546,26 @@ export default function PaperTrail() {
                 </div>
               </label>
 
+              <div style={{display:"flex",alignItems:"center",gap:8,margin:"14px 0 10px"}}>
+                <div style={{flex:1,height:1,background:"var(--border-2)"}}/>
+                <span style={{fontSize:11,color:"var(--text-4)",letterSpacing:1.5,textTransform:"uppercase"}}>or paste a link</span>
+                <div style={{flex:1,height:1,background:"var(--border-2)"}}/>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <input className="pt-input" style={{flex:1}}
+                  placeholder="arXiv URL or direct PDF link…  e.g. https://arxiv.org/abs/1706.03762"
+                  value={pdfUrl}
+                  onChange={e=>setPdfUrl(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter" && handleUrlUpload()}/>
+                <button className="pt-btn pt-btn-primary"
+                  onClick={handleUrlUpload}
+                  disabled={!pdfUrl.trim()||uploading}>
+                  Fetch & Index
+                </button>
+              </div>
+
               {uploading && (
-                <div className="pt-alert warning">
+                <div className="pt-alert warning" style={{marginTop:12}}>
                   <div className="pt-dot-pulse"><span/><span/><span/></div>
                   <span>Running entity recognition — this takes 15–30 seconds…</span>
                 </div>
@@ -547,7 +598,7 @@ export default function PaperTrail() {
         {/* Graph */}
         {activeTab==="graph" && (
           graphData.nodes.length>0
-            ? <ForceGraph graphData={graphData}/>
+            ? <CytoscapeGraph graphData={graphData}/>
             : <div className="pt-page">
                 <div className="pt-page-title">Knowledge Graph</div>
                 <div className="pt-card">
@@ -601,6 +652,13 @@ export default function PaperTrail() {
                           {msg.sources.map((s,si)=>(
                             <div key={si} className="pt-source-item">
                               <span className="pt-source-paper">{s.paper_title}</span>
+                              {s.page != null && (
+                                <span style={{
+                                  marginLeft:6,padding:"1px 6px",borderRadius:4,
+                                  background:"rgba(232,168,56,0.12)",border:"1px solid rgba(232,168,56,0.3)",
+                                  color:"#e8a838",fontFamily:"var(--font-mono)",fontSize:10
+                                }}>p.{s.page}</span>
+                              )}
                               {s.relevant_detail && <span className="pt-source-detail"> — {s.relevant_detail}</span>}
                             </div>
                           ))}
