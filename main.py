@@ -363,9 +363,16 @@ def traverse_knowledge_graph(entities: list[str], hops: int = 2) -> str:
 
     for entity in entities:
         entity_lower = entity.lower().strip()
+        entity_canon = _canonicalize_entity(entity)
         for node_id, data in kg.nodes(data=True):
             node_name = data.get("name", data.get("title", "")).lower()
-            if entity_lower in node_name or node_name in entity_lower:
+            node_canon = _canonicalize_entity(data.get("name", data.get("title", "")))
+            if (
+                entity_lower in node_name
+                or node_name in entity_lower
+                or (entity_canon and entity_canon == node_canon)
+                or (entity_canon and (entity_canon in node_canon or node_canon in entity_canon))
+            ):
                 visited = {node_id}
                 frontier = [node_id]
                 for _ in range(hops):
@@ -518,7 +525,14 @@ def extract_entities(text: str) -> dict:
                     "content": (
                         "You are an expert academic entity extractor. "
                         "Given text from a research paper, extract all structured entities and relationships. "
-                        "Be thorough — extract every author, method, dataset, metric, and concept you can find. "
+                        "Be thorough — extract every author, method, dataset, metric, and concept you can find.\n\n"
+                        "USE CANONICAL NAMES so the same entity in two papers can be linked:\n"
+                        "  • methods: 'attention' (not 'attention mechanism'), 'encoder-decoder', 'transformer', "
+                        "'recurrent neural network' (not 'RNN'), 'long short-term memory' (not 'LSTM')\n"
+                        "  • datasets: 'WMT 2014 en-fr' (not 'WMT'14 English-French translation task'), "
+                        "'WMT 2014 en-de', 'GLUE', 'SQuAD'\n"
+                        "  • metrics: 'BLEU' (not 'BLEU score'), 'F1', 'accuracy', 'perplexity'\n"
+                        "  • do NOT append words like 'model', 'mechanism', 'approach', 'task' to a name\n\n"
                         "For relationships, identify how entities relate to each other "
                         "(e.g., a method 'uses' a dataset, a paper 'proposes' an algorithm, a model 'outperforms' a baseline)."
                     ),
@@ -559,24 +573,148 @@ def _empty_extraction() -> dict:
 # KNOWLEDGE GRAPH
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Canonical aliases — collapses surface variants to a single graph node so two
+# papers that talk about the same thing actually link in the graph.
+_ENTITY_ALIASES: dict = {
+    # Architectures
+    "rnn": "recurrent neural network",
+    "rnns": "recurrent neural network",
+    "recurrent neural networks": "recurrent neural network",
+    "lstm": "long short-term memory",
+    "lstms": "long short-term memory",
+    "gru": "gated recurrent unit",
+    "grus": "gated recurrent unit",
+    "cnn": "convolutional neural network",
+    "cnns": "convolutional neural network",
+    "convolutional neural networks": "convolutional neural network",
+    "mlp": "multi-layer perceptron",
+    "mlps": "multi-layer perceptron",
+    "ffn": "feed-forward network",
+    "ffnn": "feed-forward network",
+    # Attention family
+    "attention": "attention",
+    "attention mechanism": "attention",
+    "attention mechanisms": "attention",
+    "attentional mechanism": "attention",
+    "attentional mechanisms": "attention",
+    "soft attention": "attention",
+    "additive attention": "additive attention",
+    "bahdanau attention": "additive attention",
+    "luong attention": "multiplicative attention",
+    "multiplicative attention": "multiplicative attention",
+    "dot-product attention": "scaled dot-product attention",
+    "scaled dot product attention": "scaled dot-product attention",
+    "multi head attention": "multi-head attention",
+    "self attention": "self-attention",
+    # Generic phrases
+    "encoder decoder": "encoder-decoder",
+    "encoder-decoder model": "encoder-decoder",
+    "encoder-decoder models": "encoder-decoder",
+    "encoder-decoder architecture": "encoder-decoder",
+    "encoder-decoder approach": "encoder-decoder",
+    "encoder-decoder framework": "encoder-decoder",
+    "neural machine translation": "neural machine translation",
+    "nmt": "neural machine translation",
+    "machine translation": "machine translation",
+    "sequence to sequence": "sequence-to-sequence",
+    "sequence-to-sequence": "sequence-to-sequence",
+    "seq2seq": "sequence-to-sequence",
+    "seq-to-seq": "sequence-to-sequence",
+    "transformer": "transformer",
+    "transformer model": "transformer",
+    "transformer architecture": "transformer",
+    "vanilla transformer": "transformer",
+    # Datasets
+    "wmt'14": "wmt 2014",
+    "wmt 14": "wmt 2014",
+    "wmt14": "wmt 2014",
+    "wmt 2014 english-french": "wmt 2014 en-fr",
+    "wmt'14 english-french": "wmt 2014 en-fr",
+    "wmt'14 english to french": "wmt 2014 en-fr",
+    "wmt 2014 english-german": "wmt 2014 en-de",
+    "wmt'14 english-german": "wmt 2014 en-de",
+    "wmt'14 english to german": "wmt 2014 en-de",
+    "english-french translation": "wmt 2014 en-fr",
+    "english-to-french translation": "wmt 2014 en-fr",
+    "english-german translation": "wmt 2014 en-de",
+    "english-to-german translation": "wmt 2014 en-de",
+    "wmt'15": "wmt 2015",
+    "wmt 15": "wmt 2015",
+    "wmt15": "wmt 2015",
+    "iwslt'14": "iwslt 2014",
+    "iwslt 14": "iwslt 2014",
+    # Metrics
+    "bleu score": "bleu",
+    "bleu scores": "bleu",
+    "bleu metric": "bleu",
+}
+
+_TRAILING_NOISE = (
+    " models", " model", " mechanisms", " mechanism", " approach", " approaches",
+    " architecture", " architectures", " framework", " frameworks",
+    " method", " methods", " task", " tasks", " dataset", " datasets",
+    " score", " scores", " metric", " metrics",
+)
+
+
+def _canonicalize_entity(name: str) -> str:
+    """Lowercase, strip punctuation, expand aliases, drop trailing noise."""
+    if not name:
+        return ""
+    s = name.lower().strip()
+    s = re.sub(r"[''‘’“”`,;:.\(\)\[\]]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if s in _ENTITY_ALIASES:
+        return _ENTITY_ALIASES[s]
+    for suf in _TRAILING_NOISE:
+        if s.endswith(suf):
+            stripped = s[: -len(suf)].strip()
+            if stripped in _ENTITY_ALIASES:
+                return _ENTITY_ALIASES[stripped]
+            if stripped:
+                s = stripped
+            break
+    return s
+
+
+def _add_entity_node(node_id: str, ntype: str, surface: str, **extra):
+    """Add or merge an entity node, keeping the shortest surface form as the label."""
+    if kg.has_node(node_id):
+        existing_label = kg.nodes[node_id].get("label", "")
+        # Prefer the shorter, cleaner surface form for the visible label
+        if len(surface) < len(existing_label) and len(surface) > 1:
+            kg.nodes[node_id]["label"] = surface
+            kg.nodes[node_id]["name"] = surface
+    else:
+        kg.add_node(node_id, type=ntype, name=surface, label=surface, **extra)
+
 
 def add_to_knowledge_graph(paper_id: str, entities: dict):
     paper_title = entities.get("title") or paper_id
     kg.add_node(paper_id, type="paper", title=paper_title, label=paper_title)
 
     for author in entities.get("authors", []):
-        aid = f"author:{author.lower().strip()}"
-        kg.add_node(aid, type="author", name=author, label=author)
+        canon = _canonicalize_entity(author)
+        if not canon:
+            continue
+        aid = f"author:{canon}"
+        _add_entity_node(aid, "author", author)
         kg.add_edge(aid, paper_id, relation="authored")
 
     for method in entities.get("methods", []):
-        mid = f"method:{method.lower().strip()}"
-        kg.add_node(mid, type="method", name=method, label=method)
+        canon = _canonicalize_entity(method)
+        if not canon:
+            continue
+        mid = f"method:{canon}"
+        _add_entity_node(mid, "method", method)
         kg.add_edge(paper_id, mid, relation="proposes")
 
     for dataset in entities.get("datasets", []):
-        did = f"dataset:{dataset.lower().strip()}"
-        kg.add_node(did, type="dataset", name=dataset, label=dataset)
+        canon = _canonicalize_entity(dataset)
+        if not canon:
+            continue
+        did = f"dataset:{canon}"
+        _add_entity_node(did, "dataset", dataset)
         kg.add_edge(paper_id, did, relation="evaluates_on")
 
     for metric in entities.get("metrics", []):
@@ -585,27 +723,37 @@ def add_to_knowledge_graph(paper_id: str, entities: dict):
             m_val = metric.get("value", "")
         else:
             m_name, m_val = str(metric), ""
-        m_id = f"metric:{m_name.lower().strip()}"
-        kg.add_node(m_id, type="metric", name=m_name, value=m_val, label=m_name)
+        canon = _canonicalize_entity(m_name)
+        if not canon:
+            continue
+        m_id = f"metric:{canon}"
+        _add_entity_node(m_id, "metric", m_name, value=m_val)
         kg.add_edge(paper_id, m_id, relation="reports")
 
     for concept in entities.get("key_concepts", []):
-        cid = f"concept:{concept.lower().strip()}"
-        kg.add_node(cid, type="concept", name=concept, label=concept)
+        canon = _canonicalize_entity(concept)
+        if not canon:
+            continue
+        cid = f"concept:{canon}"
+        _add_entity_node(cid, "concept", concept)
         kg.add_edge(paper_id, cid, relation="discusses")
 
     for rel in entities.get("relationships", []):
-        src = rel.get("source", "").lower().strip()
-        tgt = rel.get("target", "").lower().strip()
+        raw_src = rel.get("source", "")
+        raw_tgt = rel.get("target", "")
+        src = _canonicalize_entity(raw_src)
+        tgt = _canonicalize_entity(raw_tgt)
         relation = rel.get("relation", "related_to")
-        if src and tgt:
-            src_id = f"entity:{src}"
-            tgt_id = f"entity:{tgt}"
-            if not kg.has_node(src_id):
-                kg.add_node(src_id, type="entity", name=rel["source"], label=rel["source"])
-            if not kg.has_node(tgt_id):
-                kg.add_node(tgt_id, type="entity", name=rel["target"], label=rel["target"])
-            kg.add_edge(src_id, tgt_id, relation=relation)
+        if not (src and tgt):
+            continue
+        # Reuse an existing node of the SAME canonical name (any type) before falling back to entity:
+        src_id = next((nid for nid in kg.nodes if nid.split(":", 1)[-1] == src), f"entity:{src}")
+        tgt_id = next((nid for nid in kg.nodes if nid.split(":", 1)[-1] == tgt), f"entity:{tgt}")
+        if not kg.has_node(src_id):
+            _add_entity_node(src_id, "entity", raw_src)
+        if not kg.has_node(tgt_id):
+            _add_entity_node(tgt_id, "entity", raw_tgt)
+        kg.add_edge(src_id, tgt_id, relation=relation)
 
     logger.info(f"Graph updated — now {len(kg.nodes)} nodes, {len(kg.edges)} edges")
 
@@ -739,10 +887,22 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
         paper_ids_in_subgraph = _papers_in_subgraph(graph_raw)
         graph_context = f"KNOWLEDGE GRAPH SUBGRAPH (entities + relationships from your library):\n{graph_raw}"
 
-    # For comparative queries, restrict vector search to papers found in the subgraph.
-    restrict_to = paper_ids_in_subgraph if (qtype in ("comparative", "relational") and paper_ids_in_subgraph) else None
-    vector_raw = search_vector_store(question, top_k=top_k, paper_ids=restrict_to)
-    vector_context = f"VECTOR PASSAGES{f' (restricted to {len(restrict_to)} papers from subgraph)' if restrict_to else ''}:\n{vector_raw}"
+    # For comparative/relational queries, retrieve top chunks PER PAPER from the subgraph
+    # so one paper doesn't crowd the others out of the context window.
+    if qtype in ("comparative", "relational") and paper_ids_in_subgraph:
+        per_paper_k = max(2, top_k // max(len(paper_ids_in_subgraph), 1))
+        merged: list = []
+        for pid in paper_ids_in_subgraph:
+            r = json.loads(search_vector_store(question, top_k=per_paper_k, paper_ids=[pid]))
+            merged.extend(r.get("results", []))
+        vector_raw = json.dumps({"results": merged})
+        vector_context = (
+            f"VECTOR PASSAGES (balanced — top {per_paper_k} per paper across "
+            f"{len(paper_ids_in_subgraph)} papers in subgraph):\n{vector_raw}"
+        )
+    else:
+        vector_raw = search_vector_store(question, top_k=top_k)
+        vector_context = f"VECTOR PASSAGES:\n{vector_raw}"
 
     library_titles = [p.get("title", "") for p in papers_db.values()]
     library_listing = "\n".join(f"- {t}" for t in library_titles) or "(empty)"
@@ -789,7 +949,7 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
             "follow_up_questions": final.follow_up_questions,
             "query_type": qtype,
             "search_strategy": strategy,
-            "graph_used": bool(restrict_to),
+            "graph_used": bool(qtype in ("comparative", "relational") and paper_ids_in_subgraph),
             "papers_in_subgraph": len(paper_ids_in_subgraph),
         }
     except Exception as e:
