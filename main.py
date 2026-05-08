@@ -1523,7 +1523,11 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
     if use_graph and key_entities and len(kg.nodes) > 0:
         graph_raw = traverse_knowledge_graph(key_entities, hops=2)
         paper_ids_in_subgraph = _papers_in_subgraph(graph_raw)
-        graph_context = f"KNOWLEDGE GRAPH SUBGRAPH (entities + relationships from your library):\n{graph_raw}"
+        # Hard-cap the subgraph text in the prompt to leave headroom for the
+        # passages and the response under provider TPM limits.
+        GRAPH_BUDGET = int(os.getenv("PROMPT_GRAPH_BUDGET_CHARS", "4000"))
+        graph_text = graph_raw if len(graph_raw) <= GRAPH_BUDGET else graph_raw[:GRAPH_BUDGET] + " […truncated]"
+        graph_context = f"KNOWLEDGE GRAPH SUBGRAPH (entities + relationships from your library):\n{graph_text}"
 
     # For comparative/relational queries, retrieve top chunks PER PAPER from the subgraph
     # so one paper doesn't crowd the others out of the context window.
@@ -1541,13 +1545,26 @@ def graphrag_query(question: str, top_k: int = 5) -> dict:
         retrieval_label = f"top {top_k}"
 
     # Build numbered passage table the LLM cites by index.
+    # Verification still uses the FULL chunk text from passage_lookup, but the
+    # LLM-facing prompt truncates each passage to keep the request under the
+    # provider TPM cap (Groq free tier rejects single requests > ~12K tokens).
+    # The cap is a budget split across passages — when more passages are
+    # retrieved, each one gets a smaller slice.
+    PROMPT_CHAR_BUDGET = int(os.getenv("PROMPT_PASSAGE_BUDGET_CHARS", "16000"))
+    MIN_PER_PASSAGE = 400  # never go below this — too small to find a quote in
+    n = max(len(retrieved_chunks), 1)
+    per_passage = max(MIN_PER_PASSAGE, PROMPT_CHAR_BUDGET // n)
+
     passage_lookup: dict[int, dict] = {}
     passage_blocks: list[str] = []
     for i, c in enumerate(retrieved_chunks, start=1):
-        passage_lookup[i] = c
+        passage_lookup[i] = c  # full text retained for verification
         page = f"p.{c['page']}" if c.get("page") else "p.?"
         ptitle = (c.get("paper_title") or "Unknown").replace("\n", " ")
-        passage_blocks.append(f"[{i}] (paper={ptitle!r} | {page})\n{c['text']}")
+        text = c.get("text") or ""
+        if len(text) > per_passage:
+            text = text[:per_passage] + " […]"
+        passage_blocks.append(f"[{i}] (paper={ptitle!r} | {page})\n{text}")
     vector_context = (
         f"VECTOR PASSAGES ({retrieval_label}):\n" + "\n\n".join(passage_blocks)
         if passage_blocks
