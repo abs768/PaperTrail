@@ -1357,16 +1357,24 @@ def _papers_in_subgraph(subgraph_json: str) -> list[str]:
 
 
 # ── Quote grounding ────────────────────────────────────────────────────────────
+# Folding tables for characters PyMuPDF and the LLM disagree on:
+#   smart quotes, various dashes, asterisk lookalikes, nonbreaking spaces, etc.
+_QUOTE_FOLDS = [
+    (re.compile(r"[‘’`´]"), "'"),
+    (re.compile(r"[“”]"), '"'),
+    (re.compile(r"[–—−‐-]"), "-"),
+    (re.compile(r"[∗⋆★⁎*]"), " "),     # asterisks signal author footnotes — squash to space
+    (re.compile(r"[†‡§¶]"), " "),       # footnote daggers
+    (re.compile(r"[   ]"), " "),  # nonbreaking spaces
+]
 _QUOTE_NORMALIZE_RE = re.compile(r"\s+")
-_QUOTE_PUNCT_RE = re.compile(r"[‘’`´]")
-_QUOTE_DQUOTE_RE = re.compile(r"[“”]")
 
 
 def _normalize_for_quote_match(s: str) -> str:
     if not s:
         return ""
-    s = _QUOTE_PUNCT_RE.sub("'", s)
-    s = _QUOTE_DQUOTE_RE.sub('"', s)
+    for pat, repl in _QUOTE_FOLDS:
+        s = pat.sub(repl, s)
     s = s.lower()
     s = _QUOTE_NORMALIZE_RE.sub(" ", s).strip()
     return s
