@@ -1054,7 +1054,9 @@ def extract_entities(text: str) -> dict:
 
     Pipeline:
       1. Slice the paper into ~6k-char windows (overlapping). Cap at 5 windows.
-      2. Run structured extraction on each slice.
+      2. Run structured extraction on each slice — IN PARALLEL via a thread pool.
+         Each call is an independent LLM request, so wall time collapses to roughly
+         the slowest single call instead of the sum.
       3. Merge — dedupe entities by canonical form.
       4. Validate — drop entities that don't literally appear in the source.
     """
@@ -1066,11 +1068,10 @@ def extract_entities(text: str) -> dict:
     if not slices:
         return _empty_extraction()
 
-    logger.info("Extracting entities over %d slice(s) of length up to ~%d chars...",
+    logger.info("Extracting entities over %d slice(s) of length up to ~%d chars (parallel)...",
                 len(slices), max((len(s) for s in slices), default=0))
 
-    extractions: list[dict] = []
-    for idx, sl in enumerate(slices):
+    def _run_slice(idx: int, sl: str) -> Optional[dict]:
         try:
             result = _parse_structured(
                 messages=[
@@ -1086,10 +1087,26 @@ def extract_entities(text: str) -> dict:
                 response_model=PaperEntities,
                 model=MODEL_FAST,
             )
-            extractions.append(result.model_dump())
+            return result.model_dump()
         except Exception as e:
             logger.warning(f"Extraction pass {idx+1}/{len(slices)} failed: {e}")
-            continue
+            return None
+
+    extractions: list[dict] = []
+    if len(slices) == 1:
+        # Single slice (e.g. a short note) — no need for the thread pool overhead.
+        r = _run_slice(0, slices[0])
+        if r:
+            extractions.append(r)
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        max_workers = min(len(slices), int(os.getenv("EXTRACTION_PARALLELISM", "4")))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_run_slice, idx, sl) for idx, sl in enumerate(slices)]
+            for f in as_completed(futures):
+                r = f.result()
+                if r:
+                    extractions.append(r)
 
     if not extractions:
         return _empty_extraction()
