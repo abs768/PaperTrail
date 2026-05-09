@@ -911,7 +911,11 @@ _EXTRACT_SYS_PROMPT = (
     "(e.g. 'Adam: A method for stochastic optimization', 'Long short-term memory') as methods or concepts, "
     "and do NOT extract author lists from citation entries (e.g. 'Mitchell P. Marcus, Mary Ann Marcinkiewicz, ...') "
     "as authors of THIS paper — they are authors of cited works. Only extract entities that the paper itself "
-    "uses, proposes, evaluates, or describes as its own."
+    "uses, proposes, evaluates, or describes as its own.\n\n"
+    "Also IGNORE inline citations in the body — strings like '(Howard and Ruder, 2018)', 'Fedus et al. (2018)', "
+    "'Dai and Le, 2015', or 'Radford et al., 2018' are references to OTHER papers, not authors of THIS one. "
+    "Authors of THIS paper appear ONLY on the title page (typically right under the title). Anything that "
+    "looks like 'Surname et al., YEAR' or contains a 4-digit year is a citation and must NOT appear in the authors list."
 )
 
 
@@ -1088,11 +1092,27 @@ def _entity_appears(name: str, text_lower: str) -> bool:
     return False
 
 
+# Inline citations like 'Fedus et al. (2018)' or 'Howard and Ruder, 2018' are
+# embedded throughout paper bodies, so the references-section stripper can't
+# remove them. Drop anything that contains 'et al' or a 4-digit year — real
+# author names never look like that.
+_CITATION_PATTERN_RE = re.compile(
+    r"\bet\s+al\b|\b(?:19|20)\d{2}\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_citation(name: str) -> bool:
+    return bool(_CITATION_PATTERN_RE.search(name or ""))
+
+
 def _author_appears(name: str, text_lower: str) -> bool:
     """Author names vary wildly across papers ('John Smith', 'J. Smith',
     'Smith, J.', 'Smith et al.'). Validate by last-name presence with a
     one-letter first-initial sanity check when ambiguous."""
     if not name:
+        return False
+    if _looks_like_citation(name):
         return False
     parts = [p for p in re.split(r"[\s,]+", name.lower().strip()) if p]
     if not parts:
