@@ -13,7 +13,7 @@ const NODE_COLORS = {
   entity:  "#94a3b8", note:    "#34d399",
 };
 const NODE_SIZES = {
-  paper:34, author:22, method:24, dataset:22, metric:18, concept:17, entity:16, note:28,
+  paper:50, author:22, method:26, dataset:24, metric:20, concept:18, entity:16, note:38,
 };
 const ENTITY_META = {
   authors:      { icon:"👤", color:"#5b8def", label:"Authors" },
@@ -211,7 +211,8 @@ function CytoscapeGraph({ graphData }) {
             "background-color": "data(color)",
             "border-color": "data(color)",
             "border-width": 1.5,
-            "border-opacity": 0.7,
+            "border-opacity": 0.85,
+            "background-opacity": 0.95,
             label: ele => {
               const t = ele.data("type");
               const lbl = ele.data("label") || "";
@@ -236,39 +237,72 @@ function CytoscapeGraph({ graphData }) {
             width: "data(size)",
             height: "data(size)",
             "overlay-opacity": 0,
+            "transition-property": "opacity, border-width, border-color",
+            "transition-duration": "180ms",
           },
         },
         {
-          selector: "node[type='paper']",
-          style: { "border-width": 2.5, "font-weight": 700, color: "#f1d28a" },
+          selector: "node[type='paper'], node[type='note']",
+          style: {
+            shape: "round-rectangle",
+            "border-width": 3,
+            "border-opacity": 1,
+            "font-weight": 700,
+            "font-size": 13,
+            color: "#f1d28a",
+          },
         },
         {
           selector: "edge",
           style: {
-            width: 1,
-            "line-color": "rgba(26,40,68,0.85)",
-            "target-arrow-color": "rgba(26,40,68,0.85)",
+            width: 1.2,
+            // Edge color follows the source node's type so each paper "radiates"
+            // its color outward into its entity satellites. Low alpha keeps the
+            // graph readable when zoomed out.
+            "line-color": ele => {
+              const c = NODE_COLORS[ele.source().data("type")] || "#475569";
+              return c + "66"; // ~40% alpha
+            },
+            "target-arrow-color": ele => {
+              const c = NODE_COLORS[ele.source().data("type")] || "#475569";
+              return c + "99"; // ~60% alpha
+            },
             "target-arrow-shape": "triangle",
             "arrow-scale": 0.9,
             "curve-style": "bezier",
             "control-point-step-size": 25,
-            opacity: 0.65,
+            opacity: 1,
+            "transition-property": "opacity, width, line-color",
+            "transition-duration": "180ms",
           },
         },
         {
           selector: "node:selected",
           style: {
-            "border-width": 3,
-            "border-color": "#e8a838",
+            "border-width": 4,
+            "border-color": "#ffd166",
             "border-opacity": 1,
+          },
+        },
+        {
+          selector: "node.faded, edge.faded",
+          style: {
+            opacity: 0.12,
+          },
+        },
+        {
+          selector: "node.focused",
+          style: {
+            "border-width": 4,
+            "border-color": "#ffd166",
           },
         },
         {
           selector: "edge.highlight",
           style: {
-            "line-color": "rgba(232,168,56,0.85)",
-            "target-arrow-color": "rgba(232,168,56,0.85)",
-            width: 2,
+            "line-color": "rgba(255, 209, 102, 0.95)",
+            "target-arrow-color": "rgba(255, 209, 102, 0.95)",
+            width: 2.2,
             opacity: 1,
             label: "data(label)",
             "font-size": 10,
@@ -276,26 +310,33 @@ function CytoscapeGraph({ graphData }) {
             "text-background-opacity": 1,
             "text-background-padding": 3,
             "text-rotation": "autorotate",
-            color: "#94a3b8",
+            color: "#fde7a7",
           },
         },
       ],
       layout: {
         name: "fcose",
         animate: true,
-        animationDuration: 600,
+        animationDuration: 700,
+        animationEasing: "ease-out",
         randomize: true,
-        idealEdgeLength: 110,
-        nodeRepulsion: 6000,
-        nodeSeparation: 75,
-        gravity: 0.25,
-        padding: 30,
+        idealEdgeLength: 95,
+        nodeRepulsion: 8000,
+        nodeSeparation: 90,
+        gravity: 0.3,
+        gravityRangeCompound: 1.2,
+        padding: 40,
       },
     });
 
     cy.on("mouseover", "node", evt => {
       const n = evt.target;
+      const neighborhood = n.closedNeighborhood();
+      // Fade everything outside the hovered node's neighborhood so the focus is
+      // unmistakable. Highlight the connecting edges with the relation labels.
+      cy.elements().difference(neighborhood).addClass("faded");
       n.connectedEdges().addClass("highlight");
+      n.addClass("focused");
       const pos = n.renderedPosition();
       const r = containerRef.current.getBoundingClientRect();
       setTooltip({
@@ -305,6 +346,8 @@ function CytoscapeGraph({ graphData }) {
       });
     });
     cy.on("mouseout", "node", evt => {
+      cy.elements().removeClass("faded");
+      evt.target.removeClass("focused");
       evt.target.connectedEdges().removeClass("highlight");
       setTooltip(null);
     });
@@ -343,7 +386,18 @@ function CytoscapeGraph({ graphData }) {
         </div>
       </div>
 
-      <div style={{ position: "relative", borderRadius: 14, overflow: "hidden", background: "var(--bg-base)", border: "1px solid var(--border-1)", boxShadow: "var(--shadow-m)" }}>
+      <div style={{
+        position: "relative",
+        borderRadius: 14,
+        overflow: "hidden",
+        // Subtle radial gradient on the canvas backdrop — gives depth so the
+        // graph nodes feel like they're floating in a dark gallery rather than
+        // sitting on a flat panel.
+        background: "radial-gradient(ellipse 70% 60% at 50% 45%, rgba(232,168,56,0.06) 0%, rgba(91,141,239,0.04) 35%, var(--bg-base) 75%)",
+        backgroundColor: "var(--bg-base)",
+        border: "1px solid var(--border-1)",
+        boxShadow: "var(--shadow-m), inset 0 0 80px rgba(0,0,0,0.35)",
+      }}>
         <div ref={containerRef} style={{ width: "100%", height: "max(520px, 60vh)" }} />
         {tooltip && (
           <div style={{ position: "fixed", left: tooltip.x + 14, top: tooltip.y - 10, background: "var(--bg-card)", color: "var(--text-1)", padding: "7px 12px", borderRadius: 8, fontSize: 12, pointerEvents: "none", border: "1px solid var(--border-2)", zIndex: 999, boxShadow: "var(--shadow-m)", maxWidth: 260 }}>
