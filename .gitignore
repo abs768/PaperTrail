@@ -9,3 +9,13 @@ uploads/
 .DS_Store
 .vscode/
 .idea/
+.claude/
+state/
+__pycache__/
+*.pdf
+*.docx
+PaperTrail.jsx
+package-lock.json
+frontend/.vite/
+frontend/.gitignore
+frontend/README.md
