@@ -731,6 +731,27 @@ def extract_text_from_pdf(file_path: str) -> list[dict]:
     return pages
 
 
+def extract_pdf_metadata_title(file_path: str) -> str:
+    """Pull the PDF's embedded metadata title. arXiv-rendered PDFs reliably
+    populate this, so it's a much better fallback than the URL filename when
+    LLM extraction returns no title."""
+    try:
+        doc = fitz.open(file_path)
+        title = ((doc.metadata or {}).get("title") or "").strip()
+        doc.close()
+        # Some metadata titles are junk like "untitled" or "Microsoft Word - draft.docx"
+        if not title:
+            return ""
+        bad = ("untitled", "microsoft word", "untitled document", "doc.tex", ".tex")
+        if any(b in title.lower() for b in bad):
+            return ""
+        if len(title) < 4 or len(title) > 250:
+            return ""
+        return title
+    except Exception:
+        return ""
+
+
 # Paragraph and sentence boundaries — used by the chunker to avoid mid-sentence cuts.
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")
 # Split on .!? followed by whitespace + uppercase / quote / paren start.
@@ -1774,7 +1795,12 @@ def _ingest_pdf_bytes(file_bytes: bytes, source_label: str) -> dict:
             raise HTTPException(429, "AI API rate limited — try again in a moment.")
         raise HTTPException(500, f"Entity extraction failed: {e}")
 
-    fallback_title = source_label.rsplit("/", 1)[-1].replace(".pdf", "")
+    # Title resolution priority: LLM-extracted > PDF metadata > URL filename.
+    # arXiv PDFs reliably set the metadata title, so this gives us "Attention Is
+    # All You Need" instead of "1706.03762" even when LLM extraction returns no
+    # title (e.g., on rate-limited retry paths).
+    pdf_meta_title = extract_pdf_metadata_title(file_path)
+    fallback_title = pdf_meta_title or source_label.rsplit("/", 1)[-1].replace(".pdf", "")
     title = entities.get("title") or fallback_title
     entities["title"] = title
 
