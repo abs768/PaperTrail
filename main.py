@@ -731,23 +731,72 @@ def extract_text_from_pdf(file_path: str) -> list[dict]:
     return pages
 
 
+_TITLE_JUNK_MARKERS = ("untitled", "microsoft word", "untitled document", "doc.tex", ".tex")
+
+
+def _looks_like_real_title(title: str) -> bool:
+    if not title:
+        return False
+    if any(b in title.lower() for b in _TITLE_JUNK_MARKERS):
+        return False
+    if len(title) < 4 or len(title) > 250:
+        return False
+    return True
+
+
 def extract_pdf_metadata_title(file_path: str) -> str:
-    """Pull the PDF's embedded metadata title. arXiv-rendered PDFs reliably
-    populate this, so it's a much better fallback than the URL filename when
-    LLM extraction returns no title."""
+    """Pull the PDF's embedded metadata title. Some arXiv PDFs populate this
+    (newer submissions) but older ones don't, so this is a soft fallback."""
     try:
         doc = fitz.open(file_path)
         title = ((doc.metadata or {}).get("title") or "").strip()
         doc.close()
-        # Some metadata titles are junk like "untitled" or "Microsoft Word - draft.docx"
-        if not title:
+        return title if _looks_like_real_title(title) else ""
+    except Exception:
+        return ""
+
+
+def extract_first_page_title_heuristic(file_path: str) -> str:
+    """Pick out the title by finding the largest-font text in the upper half of
+    page 1, ignoring rotated text and left-margin watermarks (the arXiv version
+    stamp is a vertical span at x≈11 that would otherwise outrank the real
+    title). Works when both LLM extraction and PDF metadata title come up
+    empty — e.g. older arXiv papers like 1706.03762."""
+    try:
+        doc = fitz.open(file_path)
+        if len(doc) == 0:
+            doc.close()
             return ""
-        bad = ("untitled", "microsoft word", "untitled document", "doc.tex", ".tex")
-        if any(b in title.lower() for b in bad):
+        page = doc[0]
+        blocks = page.get_text("dict").get("blocks", [])
+        page_h, page_w = page.rect.height, page.rect.width
+        doc.close()
+        spans = []
+        for b in blocks:
+            if b.get("type") != 0:
+                continue
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    x0, y0, x1, y1 = span.get("bbox", [0, 0, 0, 0])
+                    w, h = x1 - x0, y1 - y0
+                    if y0 > page_h * 0.5:
+                        continue
+                    if x0 < page_w * 0.05:
+                        continue
+                    if h > w:
+                        continue
+                    txt = (span.get("text") or "").strip()
+                    sz = span.get("size", 0)
+                    if not txt or sz < 1:
+                        continue
+                    spans.append((sz, txt, y0, x0))
+        if not spans:
             return ""
-        if len(title) < 4 or len(title) > 250:
-            return ""
-        return title
+        max_size = max(s[0] for s in spans)
+        title_spans = [s for s in spans if abs(s[0] - max_size) < 0.5]
+        title_spans.sort(key=lambda s: (s[2], s[3]))
+        title = re.sub(r"\s+", " ", " ".join(s[1] for s in title_spans)).strip()
+        return title if _looks_like_real_title(title) else ""
     except Exception:
         return ""
 
@@ -1795,12 +1844,18 @@ def _ingest_pdf_bytes(file_bytes: bytes, source_label: str) -> dict:
             raise HTTPException(429, "AI API rate limited — try again in a moment.")
         raise HTTPException(500, f"Entity extraction failed: {e}")
 
-    # Title resolution priority: LLM-extracted > PDF metadata > URL filename.
-    # arXiv PDFs reliably set the metadata title, so this gives us "Attention Is
-    # All You Need" instead of "1706.03762" even when LLM extraction returns no
-    # title (e.g., on rate-limited retry paths).
+    # Title resolution priority:
+    #   LLM-extracted > PDF metadata > first-page font-size heuristic > URL filename.
+    # The metadata path covers newer arXiv submissions; the heuristic covers older
+    # ones like 1706.03762 where PDF metadata title is empty. URL filename is the
+    # last-resort fallback that gives ugly IDs like "1706.03762".
     pdf_meta_title = extract_pdf_metadata_title(file_path)
-    fallback_title = pdf_meta_title or source_label.rsplit("/", 1)[-1].replace(".pdf", "")
+    heuristic_title = "" if pdf_meta_title else extract_first_page_title_heuristic(file_path)
+    fallback_title = (
+        pdf_meta_title
+        or heuristic_title
+        or source_label.rsplit("/", 1)[-1].replace(".pdf", "")
+    )
     title = entities.get("title") or fallback_title
     entities["title"] = title
 
