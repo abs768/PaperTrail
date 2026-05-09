@@ -906,8 +906,41 @@ _EXTRACT_SYS_PROMPT = (
     "DO NOT INVENT entities. If you are not certain a method/dataset/metric is explicitly mentioned in THIS section, "
     "leave it out — a downstream validator will drop entities that do not appear in the source. "
     "For relationships, only extract those grounded in this section's text "
-    "(e.g., a method 'uses' a dataset, a paper 'proposes' an algorithm, a model 'outperforms' a baseline)."
+    "(e.g., a method 'uses' a dataset, a paper 'proposes' an algorithm, a model 'outperforms' a baseline).\n\n"
+    "IGNORE the References / Bibliography / Citations section. Do NOT extract cited paper titles "
+    "(e.g. 'Adam: A method for stochastic optimization', 'Long short-term memory') as methods or concepts, "
+    "and do NOT extract author lists from citation entries (e.g. 'Mitchell P. Marcus, Mary Ann Marcinkiewicz, ...') "
+    "as authors of THIS paper — they are authors of cited works. Only extract entities that the paper itself "
+    "uses, proposes, evaluates, or describes as its own."
 )
+
+
+_REFERENCES_HEADING_RE = re.compile(
+    r"^\s*(?:\d+\s*[.)]?\s+)?(?:References?|REFERENCES|Bibliography|BIBLIOGRAPHY|Works\s+Cited)\s*:?\s*$",
+    flags=re.MULTILINE,
+)
+
+
+def _strip_references_section(text: str) -> str:
+    """Truncate the paper at the start of its References / Bibliography section.
+
+    Citations leak into entity extraction otherwise: reference paper titles get
+    tagged as 'methods' and citation author lists get tagged as 'authors'. The
+    8B model is especially prone to this. Stripping references before slicing
+    keeps the extraction focused on the paper's own contributions.
+
+    The references heading is searched only in the latter half of the document
+    so an incidental in-prose mention of the word 'references' earlier doesn't
+    accidentally truncate the body."""
+    if not text or len(text) < 2000:
+        return text
+    half = len(text) // 2
+    last_match = None
+    for m in _REFERENCES_HEADING_RE.finditer(text, pos=half):
+        last_match = m
+    if last_match:
+        return text[: last_match.start()].rstrip()
+    return text
 
 
 # Tunables (configurable via env so we can dial extraction cost/coverage on HF Spaces
@@ -1133,6 +1166,15 @@ def extract_entities(text: str) -> dict:
     if not client:
         logger.warning("No LLM key — returning empty extraction")
         return _empty_extraction()
+
+    # Strip the references/bibliography section before slicing AND before the
+    # downstream validator runs — otherwise reference paper titles and citation
+    # author lists pollute the extraction (they appear in source text, so the
+    # validator can't drop them).
+    original_len = len(text or "")
+    text = _strip_references_section(text)
+    if original_len and len(text) < original_len:
+        logger.info("Stripped references section: %d -> %d chars", original_len, len(text))
 
     slices = _slice_for_extraction(text)
     if not slices:
