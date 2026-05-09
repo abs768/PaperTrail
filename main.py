@@ -756,6 +756,25 @@ def extract_pdf_metadata_title(file_path: str) -> str:
         return ""
 
 
+def _llm_title_is_grounded(title: str, full_text: str) -> bool:
+    """Return True if the LLM-extracted title actually appears in the source.
+
+    The 8B model sometimes paraphrases the title (e.g. emits 'Transfer Learning
+    for NLP via BERT' for the BERT paper, whose real title is 'BERT:
+    Pre-training of Deep Bidirectional Transformers for Language
+    Understanding'). Verbatim substring match in the head of the document is a
+    cheap, reliable check — if the LLM extracted what's actually written, the
+    string will be there. Trailing punctuation differences (':', '.', ',') are
+    ignored because PDF text extraction occasionally drops them."""
+    if not title or not full_text:
+        return False
+    head = full_text[:6000].lower()
+    needle = title.lower().strip().rstrip(".,:;")
+    if len(needle) < 4:
+        return False
+    return needle in head
+
+
 def extract_first_page_title_heuristic(file_path: str) -> str:
     """Pick out the title by finding the largest-font text in the upper half of
     page 1, ignoring rotated text and left-margin watermarks (the arXiv version
@@ -1122,6 +1141,13 @@ def _author_appears(name: str, text_lower: str) -> bool:
         return False
     parts = [p for p in re.split(r"[\s,]+", name.lower().strip()) if p]
     if not parts:
+        return False
+    # Real author names always have at least two whitespace/comma-separated
+    # tokens (first+last, initial+last, or 'last, first'). Single-token
+    # 'authors' like 'OpenAI', 'Google', 'DeepMind' are organizations the LLM
+    # picked up from comparison/related-work mentions, not authors of THIS
+    # paper.
+    if len(parts) < 2:
         return False
     # Heuristic: longest token is likely the surname (initials are short).
     surname = max((p for p in parts if len(p) >= 2), key=len, default="")
@@ -1913,10 +1939,13 @@ def _ingest_pdf_bytes(file_bytes: bytes, source_label: str) -> dict:
         raise HTTPException(500, f"Entity extraction failed: {e}")
 
     # Title resolution priority:
-    #   LLM-extracted > PDF metadata > first-page font-size heuristic > URL filename.
-    # The metadata path covers newer arXiv submissions; the heuristic covers older
-    # ones like 1706.03762 where PDF metadata title is empty. URL filename is the
-    # last-resort fallback that gives ugly IDs like "1706.03762".
+    #   LLM-extracted (if grounded) > PDF metadata > first-page font-size heuristic > URL filename.
+    # The grounding check guards against the 8B model paraphrasing the title
+    # (e.g. emitting 'Transfer Learning for NLP via BERT' instead of the actual
+    # 'BERT: Pre-training of Deep Bidirectional Transformers...'). If the
+    # LLM-emitted title doesn't appear verbatim near the start of the source,
+    # we treat it as a hallucination and fall through to the deterministic
+    # extractors below.
     pdf_meta_title = extract_pdf_metadata_title(file_path)
     heuristic_title = "" if pdf_meta_title else extract_first_page_title_heuristic(file_path)
     fallback_title = (
@@ -1924,7 +1953,8 @@ def _ingest_pdf_bytes(file_bytes: bytes, source_label: str) -> dict:
         or heuristic_title
         or source_label.rsplit("/", 1)[-1].replace(".pdf", "")
     )
-    title = entities.get("title") or fallback_title
+    llm_title = (entities.get("title") or "").strip()
+    title = llm_title if _llm_title_is_grounded(llm_title, full_text) else fallback_title
     entities["title"] = title
 
     add_to_knowledge_graph(paper_id, entities)
