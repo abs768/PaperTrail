@@ -913,9 +913,10 @@ _EXTRACT_SYS_PROMPT = (
     "as authors of THIS paper — they are authors of cited works. Only extract entities that the paper itself "
     "uses, proposes, evaluates, or describes as its own.\n\n"
     "Also IGNORE inline citations in the body — strings like '(Howard and Ruder, 2018)', 'Fedus et al. (2018)', "
-    "'Dai and Le, 2015', or 'Radford et al., 2018' are references to OTHER papers, not authors of THIS one. "
-    "Authors of THIS paper appear ONLY on the title page (typically right under the title). Anything that "
-    "looks like 'Surname et al., YEAR' or contains a 4-digit year is a citation and must NOT appear in the authors list."
+    "'Dai and Le, 2015', 'Howard and Ruder', 'Dai and Le', or 'Radford et al., 2018' are references to OTHER "
+    "papers, not authors of THIS one. Authors of THIS paper appear ONLY on the title page (typically right "
+    "under the title). Anything matching 'Surname et al.', 'Surname and Surname', or anything containing a "
+    "4-digit year is a citation and MUST NOT appear in the authors list."
 )
 
 
@@ -1092,12 +1093,17 @@ def _entity_appears(name: str, text_lower: str) -> bool:
     return False
 
 
-# Inline citations like 'Fedus et al. (2018)' or 'Howard and Ruder, 2018' are
-# embedded throughout paper bodies, so the references-section stripper can't
-# remove them. Drop anything that contains 'et al' or a 4-digit year — real
-# author names never look like that.
+# Inline citations like 'Fedus et al. (2018)', 'Howard and Ruder, 2018', or the
+# bare two-author form 'Dai and Le' are embedded throughout paper bodies, so the
+# references-section stripper can't remove them. Drop anything matching one of
+# three citation signatures — real author entries never contain these patterns:
+#   - 'et al' (with or without trailing period)
+#   - a 4-digit year (1900–2099)
+#   - the standalone word 'and' (two-author citation: 'Howard and Ruder')
+# Word boundaries ensure 'and' inside names like 'Andrea' or 'Fernandez' is
+# safe — those have no \b adjacent to the letters and-n-d.
 _CITATION_PATTERN_RE = re.compile(
-    r"\bet\s+al\b|\b(?:19|20)\d{2}\b",
+    r"\bet\s+al\b|\b(?:19|20)\d{2}\b|\band\b",
     flags=re.IGNORECASE,
 )
 
