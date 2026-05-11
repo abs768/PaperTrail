@@ -43,9 +43,11 @@ npm install
 npm run dev
 ```
 
+Vite will serve at `http://localhost:5173` and talk to the backend at `:8000`.
+
 ### 3. Demo Flow
 
-1. Open the frontend in browser
+1. Open `http://localhost:5173` in your browser
 2. Go to **Upload** tab → upload 2-3 research PDFs
 3. Switch to **Knowledge Graph** → show the auto-generated entity graph
 4. Go to **Ask** tab → ask a cross-paper question like:
