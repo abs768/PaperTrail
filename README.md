@@ -35,21 +35,13 @@ Backend runs at `http://localhost:8000`
 
 ### 2. Frontend
 
-The frontend is a React component (`PaperTrail.jsx`). You have two options:
+The `frontend/` folder is a complete Vite + React app:
 
-**Option A: Quick — Use Vite**
 ```bash
-npm create vite@latest frontend -- --template react
 cd frontend
 npm install
-
-# Replace src/App.jsx with the PaperTrail.jsx content
-# Then run:
 npm run dev
 ```
-
-**Option B: Even quicker — Single HTML file**
-See `index.html` in the frontend folder (if provided), which loads React via CDN.
 
 ### 3. Demo Flow
 
@@ -66,13 +58,13 @@ See `index.html` in the frontend folder (if provided), which loads React via CDN
 
 ```
 PDF Upload → Text Extraction (PyMuPDF)
-           → Entity Extraction (GPT-4o)
+           → Entity Extraction (Groq llama-3.3-70b)
            → Knowledge Graph (NetworkX)
            → Vector Embeddings (ChromaDB)
 
 Query → Vector Search (ChromaDB)
       → Graph Traversal (NetworkX)
-      → Answer Generation (GPT-4o)
+      → Answer Generation (Groq llama-3.3-70b)
       → Cited Response
 ```
 
@@ -95,7 +87,7 @@ The system still works without an API key — it just skips entity extraction (n
 ## Deployment (single container)
 
 The included `Dockerfile` builds the frontend and serves it through the FastAPI
-backend on a single port — same shape as a Streamlit Cloud deploy.
+backend on a single port.
 
 ### Hugging Face Spaces (free, recommended)
 
