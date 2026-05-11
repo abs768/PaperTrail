@@ -56,6 +56,8 @@ npm run dev
 
 ## Architecture
 
+![PaperTrail architecture](./architecture.png)
+
 ```
 PDF Upload → Text Extraction (PyMuPDF)
            → Entity Extraction (Groq llama-3.3-70b)
@@ -73,11 +75,14 @@ Query → Vector Search (ChromaDB)
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | /upload | Upload and process a PDF |
+| POST | /upload-url | Ingest a paper from a URL (e.g. arXiv) |
 | POST | /note | Add a text note |
 | POST | /query | Ask a question (GraphRAG) |
 | GET | /papers | List all papers |
+| GET | /papers/{paper_id} | Fetch a single paper |
 | GET | /graph | Get knowledge graph (nodes + edges) |
 | GET | /stats | System statistics |
+| DELETE | /papers/{paper_id} | Delete a single paper |
 | DELETE | /reset | Reset everything |
 
 ## Without an API Key
