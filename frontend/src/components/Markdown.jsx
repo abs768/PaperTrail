@@ -8,7 +8,7 @@ function renderInline(text) {
       { re:/`([^`]+)`/,     t:"c" },
     ].map(({re,t})=>{ const m=s.match(re); return m?{m,t,i:m.index}:null; })
      .filter(Boolean).sort((a,b)=>a.i-b.i);
-    if (!hits.length) { parts.push(<span key={k++}>{s}</span>); break; }
+    if (!hits.length) { parts.push(<span key={k}>{s}</span>); break; }
     const {m,t,i} = hits[0];
     if (i>0) parts.push(<span key={k++}>{s.slice(0,i)}</span>);
     if (t==="b") parts.push(<strong key={k++} style={{color:"#f1f5f9",fontWeight:700}}>{m[1]}</strong>);
