@@ -436,6 +436,32 @@ def get_graph(limit: int = 0):
     }
 
 
+@app.get("/export")
+def export_library(include_chunks: bool = False):
+    """Export the whole library as portable JSON: paper metadata and the
+    knowledge graph (node-link format). `?include_chunks=true` adds every
+    indexed text chunk with its metadata — a complete backup that pairs with
+    the JSON state format."""
+    import networkx as nx
+    payload = {
+        "exported_at": datetime.now().isoformat(),
+        "paper_count": len(state.papers_db),
+        "papers": state.papers_db,
+        "graph": nx.node_link_data(state.kg),
+    }
+    if include_chunks:
+        got = state.collection.get(include=["documents", "metadatas"])
+        payload["chunks"] = [
+            {
+                "id": cid,
+                "text": (got.get("documents") or [])[i],
+                "metadata": (got.get("metadatas") or [])[i],
+            }
+            for i, cid in enumerate(got.get("ids") or [])
+        ]
+    return payload
+
+
 @app.get("/stats")
 def get_stats():
     node_types = {}
