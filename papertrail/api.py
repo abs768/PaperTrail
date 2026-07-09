@@ -405,16 +405,35 @@ def get_paper(paper_id: str):
 
 
 @app.get("/graph")
-def get_graph():
+def get_graph(limit: int = 0):
+    """Return the knowledge graph. With `?limit=N` (N > 0), large graphs are
+    trimmed for rendering: paper/note nodes are always kept, then the
+    highest-degree entities fill the remaining budget. Edges between dropped
+    nodes are omitted."""
+    kg = state.kg
+    keep = set(kg.nodes)
+    truncated = False
+    if 0 < limit < len(keep):
+        anchors = [n for n, d in kg.nodes(data=True) if d.get("type") in ("paper", "note")]
+        rest = sorted(
+            (n for n in kg.nodes if n not in set(anchors)),
+            key=kg.degree, reverse=True,
+        )
+        keep = set(anchors) | set(rest[: max(limit - len(anchors), 0)])
+        truncated = len(keep) < len(kg.nodes)
     nodes = [
         {"id": nid, "label": data.get("label", data.get("name", nid)), "type": data.get("type", "unknown")}
-        for nid, data in state.kg.nodes(data=True)
+        for nid, data in kg.nodes(data=True) if nid in keep
     ]
     edges = [
         {"source": src, "target": tgt, "relation": data.get("relation", "related")}
-        for src, tgt, data in state.kg.edges(data=True)
+        for src, tgt, data in kg.edges(data=True) if src in keep and tgt in keep
     ]
-    return {"nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges)}
+    return {
+        "nodes": nodes, "edges": edges,
+        "node_count": len(nodes), "edge_count": len(edges),
+        "total_nodes": len(kg.nodes), "truncated": truncated,
+    }
 
 
 @app.get("/stats")
