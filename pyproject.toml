@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "papertrail"
+version = "2.0.0"
+description = "Research memory agent: GraphRAG over your paper library with grounded, verified citations"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dynamic = ["dependencies"]
+
+[project.urls]
+Repository = "https://github.com/abs768/PaperTrail"
+
+[tool.setuptools]
+packages = ["papertrail"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = "requirements.txt" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
