@@ -19,6 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY papertrail ./papertrail
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Hugging Face Spaces, Render, Fly.io all set $PORT (HF default = 7860)
