@@ -1,7 +1,14 @@
 """PDF text extraction, title recovery, and text chunking."""
+import os
 import re
 
 import fitz  # PyMuPDF
+
+# Chunking geometry, tunable via env: larger chunks = fewer embeddings and more
+# context per passage; smaller = finer-grained retrieval. Overlap keeps
+# sentences that straddle a boundary findable from both sides.
+_CHUNK_TARGET_WORDS = int(os.getenv("CHUNK_TARGET_WORDS", "400"))
+_CHUNK_OVERLAP_WORDS = int(os.getenv("CHUNK_OVERLAP_WORDS", "80"))
 
 
 def extract_text_from_pdf(file_path: str) -> list[dict]:
@@ -171,16 +178,20 @@ def _pack_units(units: list[str], target_words: int, overlap_words: int) -> list
     return chunks
 
 
-def chunk_text(text: str, target_words: int = 400, overlap_words: int = 80) -> list[str]:
+def chunk_text(text: str, target_words: int = None, overlap_words: int = None) -> list[str]:
     """Paragraph- then sentence-aware chunking. Used for notes (no page metadata)."""
+    target_words = target_words if target_words is not None else _CHUNK_TARGET_WORDS
+    overlap_words = overlap_words if overlap_words is not None else _CHUNK_OVERLAP_WORDS
     paras = _split_paragraphs(text)
     if not paras:
         return []
     return [c for c in _pack_units(paras, target_words, overlap_words) if c.strip()]
 
 
-def chunk_pages(pages: list[dict], target_words: int = 400, overlap_words: int = 80) -> list[dict]:
+def chunk_pages(pages: list[dict], target_words: int = None, overlap_words: int = None) -> list[dict]:
     """Chunk per-page so each chunk carries a single page number for provenance."""
+    target_words = target_words if target_words is not None else _CHUNK_TARGET_WORDS
+    overlap_words = overlap_words if overlap_words is not None else _CHUNK_OVERLAP_WORDS
     out: list[dict] = []
     for p in pages:
         paras = _split_paragraphs(p["text"])
