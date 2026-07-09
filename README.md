@@ -10,6 +10,11 @@ pinned: false
 
 # PaperTrail: The Research Memory Agent
 
+[![CI](https://github.com/abs768/PaperTrail/actions/workflows/ci.yml/badge.svg)](https://github.com/abs768/PaperTrail/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![React 19](https://img.shields.io/badge/react-19-61dafb.svg)](https://react.dev/)
+
 ## Quick Setup (5 minutes)
 
 ### 1. Backend
