@@ -31,6 +31,14 @@ export GROQ_API_KEY="gsk_your-key-here"
 python main.py
 ```
 
+Instead of exporting variables you can also `cp .env.example .env` and edit it —
+the server loads `.env` automatically. See [.env.example](./.env.example) for
+every available knob (models, extraction budgets, admin token, upload limits…).
+
+Optional: for the cross-encoder rerank stage (better retrieval precision, ~2 GB
+of extra dependencies), install `pip install -r requirements-reranker.txt` and
+run with `ENABLE_RERANKER=1`.
+
 Backend runs at `http://localhost:8000`
 
 ### 2. Frontend
@@ -66,26 +74,49 @@ PDF Upload → Text Extraction (PyMuPDF)
            → Knowledge Graph (NetworkX)
            → Vector Embeddings (ChromaDB)
 
-Query → Vector Search (ChromaDB)
+Query → Vector Search (ChromaDB) + BM25 → Reciprocal Rank Fusion
       → Graph Traversal (NetworkX)
       → Answer Generation (Groq llama-3.3-70b)
+      → Citation Verification + Faithfulness Check
       → Cited Response
 ```
+
+The backend lives in the `papertrail/` package:
+
+| Module | Responsibility |
+|--------|----------------|
+| `config.py` | env config, storage paths, LLM client, structured-output helpers |
+| `models.py` | Pydantic models (LLM outputs + API request bodies) |
+| `state.py` | knowledge graph + paper metadata + ChromaDB collection, JSON persistence |
+| `textproc.py` | PDF text extraction, title recovery, chunking |
+| `kgraph.py` | entity canonicalization, graph building/traversal |
+| `extraction.py` | LLM entity extraction + source-grounded validation |
+| `retrieval.py` | hybrid vector+BM25 retrieval (RRF), optional reranker |
+| `query.py` | GraphRAG query pipeline with grounded citations |
+| `api.py` | FastAPI app and endpoints |
+
+The frontend mirrors this: `frontend/src/components/` holds one component per
+panel (Upload, Knowledge Graph, Ask, Library, Sidebar) plus shared pieces.
 
 ## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| GET | /api/health | Health check |
 | POST | /upload | Upload and process a PDF |
-| POST | /upload-url | Ingest a paper from a URL (e.g. arXiv) |
+| POST | /upload-url | Ingest a paper from a URL (arXiv URLs also get exact title/authors from the arXiv API) |
 | POST | /note | Add a text note |
 | POST | /query | Ask a question (GraphRAG) |
+| POST | /query/stream | Same, as Server-Sent Events: live pipeline progress, then the result |
 | GET | /papers | List all papers |
 | GET | /papers/{paper_id} | Fetch a single paper |
 | GET | /graph | Get knowledge graph (nodes + edges) |
 | GET | /stats | System statistics |
-| DELETE | /papers/{paper_id} | Delete a single paper |
-| DELETE | /reset | Reset everything |
+| DELETE | /papers/{paper_id} | Delete a single paper † |
+| DELETE | /reset | Reset everything † |
+
+† If the `ADMIN_TOKEN` env var is set, these require a matching `X-Admin-Token`
+header — recommended on public deploys.
 
 ## Without an API Key
 
@@ -117,6 +148,17 @@ docker run -p 7860:7860 -e GROQ_API_KEY=$GROQ_API_KEY papertrail
 # open http://localhost:7860
 ```
 
-> **Note**: ChromaDB and the knowledge graph are in-memory, so data is lost on
-> restart. For persistence, mount a volume and switch ChromaDB to a persistent
-> client (`chromadb.PersistentClient(path="/data/chroma")`).
+> **Note**: State persists across restarts — ChromaDB uses a persistent client
+> and the knowledge graph + paper metadata are saved as JSON. Everything lives
+> under `STATE_DIR` (`/data` on HF Spaces if it exists, else `./state`), so
+> mount a volume there to keep your library across container recreations.
+
+## Tests
+
+```bash
+pip install pytest
+pytest tests/
+```
+
+CI (GitHub Actions) runs the Python test suite plus frontend lint and build on
+every push and pull request.
