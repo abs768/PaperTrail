@@ -19,3 +19,8 @@ package-lock.json
 frontend/.vite/
 frontend/.gitignore
 frontend/README.md
+
+# recall eval
+eval_recall/reports/
+.venv/
+**/__pycache__/
