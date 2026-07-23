@@ -1,9 +1,9 @@
-fastapi==0.139.0
+fastapi==0.139.2
 uvicorn==0.51.0
 pymupdf==1.28.0
 networkx==3.6.1
 chromadb==1.5.9
-openai==2.45.0
+openai==2.47.0
 httpx<0.29
 python-multipart==0.0.32
 pydantic==2.13.4
