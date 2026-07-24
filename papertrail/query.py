@@ -159,6 +159,27 @@ def _verify_quote(quote: str, chunk_text: str, min_words: int = 3, fuzzy_thresho
     return False
 
 
+def _entities_mentioned_in(question: str, limit: int = 8) -> list[str]:
+    """Graph entities whose name occurs in the question.
+
+    Stands in for the LLM classifier when no model is configured: instead of
+    asking a model which entities the question is about, match the question
+    against the names already in the graph. Longer names are preferred, so
+    'graph attention network' wins over 'network'.
+    """
+    q = f" {question.lower()} "
+    hits = []
+    for node, data in state.kg.nodes(data=True):
+        name = str(data.get("name") or node)
+        # Skip paper nodes; those are reached by traversal, not by name match.
+        if data.get("type") == "paper" or len(name) < 3:
+            continue
+        if f" {name.lower()} " in q or name.lower() in q.split():
+            hits.append(name)
+    hits.sort(key=len, reverse=True)
+    return hits[:limit]
+
+
 def _check_faithfulness(question: str, answer: str, passages_block: str, graph_block: str) -> Optional[FaithfulnessReport]:
     """Strict fact-check: flag substantive claims in the answer that no passage
     supports. Returns None on failure (we don't want a verifier hiccup to block
@@ -238,11 +259,41 @@ def graphrag_query(question: str, top_k: int = 5, progress: Optional[Callable[[s
                 pass  # a broken progress listener must never break the query
 
     if not config.client:
-        vector_results = json.loads(search_vector_store(question, top_k))
+        # Retrieval-only mode. Embeddings and BM25 run locally, so hybrid search
+        # and graph traversal work without any API key — only the synthesis and
+        # verification steps are unavailable. Return the retrieved evidence
+        # rather than a stub, and say plainly what is missing.
+        _emit("retrieving")
+        passages = _search_chunks(question, top_k=top_k)
+        by_paper: dict = {}
+        for p in passages:
+            pid = p.get("paper_id")
+            if pid and pid not in by_paper:
+                by_paper[pid] = {
+                    "paper_id": pid,
+                    "title": p.get("paper_title")
+                    or state.papers_db.get(pid, {}).get("title", "Unknown"),
+                }
+        graph_context = None
+        entities = _entities_mentioned_in(question)
+        if entities:
+            try:
+                _emit("traversing", {"entities": entities})
+                graph_context = json.loads(traverse_knowledge_graph(entities))
+            except Exception as e:
+                logger.warning(f"Graph traversal failed in retrieval-only mode: {e}")
+
         return {
-            "answer": "LLM API key not configured. Raw search results returned.",
-            "sources": [],
-            "passages": vector_results.get("results", []),
+            "answer": (
+                "Retrieval-only mode — no language model is configured, so the "
+                "passages below are returned unsummarised. Hybrid search over the "
+                "library and knowledge-graph traversal both ran normally; only "
+                "answer synthesis and the faithfulness check are unavailable."
+            ),
+            "retrieval_only": True,
+            "sources": list(by_paper.values()),
+            "passages": passages,
+            "graph_context": graph_context,
             "confidence": 0.0,
             "follow_up_questions": [],
         }

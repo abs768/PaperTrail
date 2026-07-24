@@ -41,6 +41,14 @@ logger.info(f"State directory: {STATE_DIR}")
 _GROQ_KEY = os.getenv("GROQ_API_KEY")
 _GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
+# ── Demo mode ────────────────────────────────────────────────────────────────
+# A public read-only deployment: the library is seeded from a snapshot and the
+# mutating endpoints are closed. Retrieval and the knowledge graph work without
+# an LLM key, because embeddings run locally — so the demo is useful even with
+# synthesis switched off, and there is no key on a public URL to be abused.
+DEMO_MODE = os.getenv("DEMO_MODE", "").lower() in ("1", "true", "yes", "on")
+DEMO_SNAPSHOT = os.getenv("DEMO_SNAPSHOT", "demo/library.json")
+
 if _GROQ_KEY:
     client = OpenAI(api_key=_GROQ_KEY, base_url="https://api.groq.com/openai/v1")
     _DEFAULT_MODEL = "llama-3.3-70b-versatile"
