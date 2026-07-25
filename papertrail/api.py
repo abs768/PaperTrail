@@ -490,12 +490,18 @@ def delete_paper(paper_id: str, x_admin_token: str = Header(default="")):
             mark_bm25_dirty()
         except Exception as e:
             logger.warning(f"Chroma delete failed for {paper_id}: {e}")
-        # Drop graph nodes that are exclusive to this paper (the paper node and any orphans)
+        # Drop graph nodes that are exclusive to this paper: the paper node, plus
+        # any entity that this paper was the last one referencing. Only the
+        # deleted paper's former neighbours can be newly orphaned, and a node
+        # still listed in papers_db is a library item, not an orphan — a paper
+        # whose extraction yielded no entities has degree 0 from the start and
+        # must survive an unrelated delete.
         if state.kg.has_node(paper_id):
+            neighbours = set(state.kg.predecessors(paper_id)) | set(state.kg.successors(paper_id))
             state.kg.remove_node(paper_id)
-        orphans = [n for n in list(state.kg.nodes) if state.kg.degree(n) == 0]
-        for n in orphans:
-            state.kg.remove_node(n)
+            for n in neighbours:
+                if n not in state.papers_db and state.kg.degree(n) == 0:
+                    state.kg.remove_node(n)
         state.papers_db.pop(paper_id, None)
         # Remove the stored PDF (paper ids are "paper:{file_hash}"; notes have no file).
         if paper_id.startswith("paper:"):
