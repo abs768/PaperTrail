@@ -571,13 +571,26 @@ def reset_system(x_admin_token: str = Header(default="")):
 
 
 # ── Serve built frontend (single-container deploy) ────────────────────────────
-_FRONTEND_DIST = pathlib.Path(__file__).parent.parent / "frontend" / "dist"
+_FRONTEND_DIST = (pathlib.Path(__file__).parent.parent / "frontend" / "dist").resolve()
 if _FRONTEND_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
 
+    def _safe_dist_file(full_path: str):
+        """Resolve `full_path` under the dist root, or None if it would escape.
+
+        `full_path` is attacker-controlled and may contain traversal sequences
+        (including percent-encoded ones like %2e%2e%2f that survive URL
+        normalization). Resolving the joined path and confirming it stays within
+        _FRONTEND_DIST is what stops it from serving .env, source, or /etc/passwd.
+        """
+        candidate = (_FRONTEND_DIST / full_path).resolve()
+        if candidate != _FRONTEND_DIST and _FRONTEND_DIST not in candidate.parents:
+            return None
+        return candidate if candidate.is_file() else None
+
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa_fallback(full_path: str):
-        candidate = _FRONTEND_DIST / full_path
-        if candidate.is_file():
+        candidate = _safe_dist_file(full_path)
+        if candidate is not None:
             return FileResponse(candidate)
         return FileResponse(_FRONTEND_DIST / "index.html")
