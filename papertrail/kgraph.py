@@ -264,8 +264,14 @@ def traverse_knowledge_graph(entities: list[str], hops: int = 2) -> str:
     return json.dumps({"results": unique[:30]})
 
 
+# Library items — the things that own chunks in the vector store. Notes are
+# ingested as "note:<uuid>" and papers as "paper:<hash>"; both are added to the
+# graph by add_to_knowledge_graph, so both must be recognised here.
+_LIBRARY_ID_PREFIXES = ("paper:", "note:")
+
+
 def _papers_in_subgraph(subgraph_json: str) -> list[str]:
-    """Extract paper_ids from a traverse_knowledge_graph JSON result."""
+    """Extract library item ids (papers and notes) from a traverse_knowledge_graph result."""
     try:
         data = json.loads(subgraph_json)
     except Exception:
@@ -273,6 +279,6 @@ def _papers_in_subgraph(subgraph_json: str) -> list[str]:
     paper_ids = set()
     for entry in data.get("results", []):
         nid = entry.get("id", "")
-        if nid.startswith("paper:"):
+        if nid.startswith(_LIBRARY_ID_PREFIXES):
             paper_ids.add(nid)
     return list(paper_ids)
