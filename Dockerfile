@@ -20,6 +20,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY papertrail ./papertrail
+# The demo snapshot. DEMO_SNAPSHOT defaults to the relative path
+# "demo/library.json", resolved against WORKDIR, so without this the read-only
+# demo boots with an empty library: seed_if_empty finds no file, logs it, and
+# carries on serving nothing. Needed for any DEMO_MODE=1 deployment.
+COPY demo ./demo
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Hugging Face Spaces, Render, Fly.io all set $PORT (HF default = 7860)
