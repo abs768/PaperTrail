@@ -88,21 +88,24 @@ class TestSsrfGuard:
         assert "sources" in r.json()
 
 
-@pytest.mark.skipif(
+_needs_build = pytest.mark.skipif(
     not api._FRONTEND_DIST.is_dir(),
-    reason="SPA fallback route only mounts when frontend/dist exists",
+    reason="needs a built frontend/dist: the SPA route only mounts when it exists",
 )
+
+
 class TestSpaFallbackTraversal:
     """The catch-all SPA route must never serve files outside the dist root,
     even when the traversal is percent-encoded to survive URL normalization.
     Regression for an arbitrary-file-read that exposed .env / source / etc.
 
-    The whole class is gated on frontend/dist existing: api.py defines both the
-    route and `_safe_dist_file` inside `if _FRONTEND_DIST.is_dir()`, so without
-    a built frontend the helper does not exist to be tested. CI's backend job
-    never builds the frontend, so these skip there — see the README note about
-    running the frontend build if you want this covered locally."""
+    `_safe_dist_file` is defined unconditionally in api.py, so the escape check
+    below runs everywhere — including on a checkout with no frontend build. Only
+    the two tests that need real files on disk (an actual index.html, and the
+    mounted route) carry `_needs_build`. CI builds the frontend for the backend
+    job precisely so those two run there rather than silently skipping."""
 
+    @_needs_build
     @pytest.mark.parametrize(
         "payload",
         [
@@ -124,9 +127,15 @@ class TestSpaFallbackTraversal:
         assert "def _spa_fallback" not in body   # api.py source
 
     def test_safe_dist_file_rejects_escape(self):
+        # No build needed: an escaping path resolves outside the dist root and
+        # is rejected on that basis alone, so this is the one security assertion
+        # that holds — and runs — on any checkout.
         assert api._safe_dist_file("../../main.py") is None
         assert api._safe_dist_file("../../.env") is None
+        assert api._safe_dist_file("../../papertrail/config.py") is None
+        assert api._safe_dist_file("../../../../../../etc/passwd") is None
 
+    @_needs_build
     def test_safe_dist_file_allows_index(self):
         # index.html lives in dist and must still resolve.
         assert api._safe_dist_file("index.html") is not None
