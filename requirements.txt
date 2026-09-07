@@ -1,14 +1,14 @@
-fastapi==0.139.0
-uvicorn==0.51.0
-pymupdf==1.28.0
+fastapi==0.141.1
+uvicorn==0.52.4
+pymupdf==1.28.2
 networkx==3.6.1
 chromadb==1.5.9
-openai==2.45.0
+openai==3.6.0
 httpx<0.29
 python-multipart==0.0.32
-pydantic==2.13.4
+pydantic==2.13.5
 rank-bm25==0.2.2
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 # The optional cross-encoder reranker (ENABLE_RERANKER=1) needs
 # sentence-transformers + torch (~2 GB extra). Install separately:
 #   pip install -r requirements-reranker.txt

@@ -1,2 +1,2 @@
 # Only needed when running with ENABLE_RERANKER=1 (cross-encoder rerank stage).
-sentence-transformers==5.6.0
+sentence-transformers==6.0.1
