@@ -88,15 +88,21 @@ class TestSsrfGuard:
         assert "sources" in r.json()
 
 
+@pytest.mark.skipif(
+    not api._FRONTEND_DIST.is_dir(),
+    reason="SPA fallback route only mounts when frontend/dist exists",
+)
 class TestSpaFallbackTraversal:
     """The catch-all SPA route must never serve files outside the dist root,
     even when the traversal is percent-encoded to survive URL normalization.
-    Regression for an arbitrary-file-read that exposed .env / source / etc."""
+    Regression for an arbitrary-file-read that exposed .env / source / etc.
 
-    @pytest.mark.skipif(
-        not api._FRONTEND_DIST.is_dir(),
-        reason="SPA fallback route only mounts when frontend/dist exists",
-    )
+    The whole class is gated on frontend/dist existing: api.py defines both the
+    route and `_safe_dist_file` inside `if _FRONTEND_DIST.is_dir()`, so without
+    a built frontend the helper does not exist to be tested. CI's backend job
+    never builds the frontend, so these skip there — see the README note about
+    running the frontend build if you want this covered locally."""
+
     @pytest.mark.parametrize(
         "payload",
         [
