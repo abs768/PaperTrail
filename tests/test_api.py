@@ -86,3 +86,47 @@ class TestSsrfGuard:
         r = client.post("/query", json={"question": "anything?"})
         assert r.status_code == 200
         assert "sources" in r.json()
+
+
+@pytest.mark.skipif(
+    not api._FRONTEND_DIST.is_dir(),
+    reason="SPA fallback route only mounts when frontend/dist exists",
+)
+class TestSpaFallbackTraversal:
+    """The catch-all SPA route must never serve files outside the dist root,
+    even when the traversal is percent-encoded to survive URL normalization.
+    Regression for an arbitrary-file-read that exposed .env / source / etc.
+
+    The whole class is gated on frontend/dist existing: api.py defines both the
+    route and `_safe_dist_file` inside `if _FRONTEND_DIST.is_dir()`, so without
+    a built frontend the helper does not exist to be tested. CI's backend job
+    never builds the frontend, so these skip there — see the README note about
+    running the frontend build if you want this covered locally."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "/%2e%2e%2f%2e%2e%2f.env",
+            "/%2e%2e%2f%2e%2e%2fpapertrail%2fconfig.py",
+            "/%2e%2e%2f%2e%2e%2fmain.py",
+            "/%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "/..%2f..%2fmain.py",
+        ],
+    )
+    def test_traversal_does_not_escape_dist(self, client, payload):
+        r = client.get(payload)
+        # It should fall back to index.html, never leak the targeted file.
+        assert r.status_code == 200
+        body = r.text
+        assert "root:x:0:0" not in body          # /etc/passwd
+        assert "PaperTrail entrypoint" not in body  # main.py docstring
+        assert "GROQ" not in body and "API_KEY" not in body  # .env / config
+        assert "def _spa_fallback" not in body   # api.py source
+
+    def test_safe_dist_file_rejects_escape(self):
+        assert api._safe_dist_file("../../main.py") is None
+        assert api._safe_dist_file("../../.env") is None
+
+    def test_safe_dist_file_allows_index(self):
+        # index.html lives in dist and must still resolve.
+        assert api._safe_dist_file("index.html") is not None

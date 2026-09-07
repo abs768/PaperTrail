@@ -15,6 +15,25 @@ pinned: false
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![React 19](https://img.shields.io/badge/react-19-61dafb.svg)](https://react.dev/)
 
+Drop research papers in; ask questions across all of them. PaperTrail extracts
+entities from every PDF into a knowledge graph, indexes the text for hybrid
+search, and answers questions with citations it has **verified against the
+source text** — every quote is checked character-for-character against the
+passage it claims to come from, and anything that fails is dropped rather than
+shown.
+
+- **Grounded citations, not claimed ones.** The model emits only a passage
+  number and a verbatim quote; the paper title and page are filled in
+  server-side. Unverifiable citations never reach the UI.
+  → [How grounding works](#grounded-citations)
+- **Measured retrieval, not asserted.** Recall@1 77.8%, Recall@5 100%, MRR 0.870
+  on a controlled benchmark, reproducible in one command.
+  → [Evaluation](#evaluation)
+- **Hybrid retrieval.** ChromaDB dense vectors + BM25, fused with Reciprocal
+  Rank Fusion, with an optional cross-encoder rerank stage.
+- **Works without an API key**, in a reduced mode — retrieval is fully local.
+  → [Without an API key](#without-an-api-key)
+
 ## Quick Setup (5 minutes)
 
 ### 1. Backend
@@ -103,6 +122,90 @@ The backend lives in the `papertrail/` package:
 The frontend mirrors this: `frontend/src/components/` holds one component per
 panel (Upload, Knowledge Graph, Ask, Library, Sidebar) plus shared pieces.
 
+## Grounded citations
+
+The usual failure mode of a RAG system is a citation that looks authoritative
+and points at nothing. PaperTrail is built so the model structurally cannot
+fabricate provenance.
+
+Retrieved passages are handed to the model as a numbered list. For each claim it
+makes, it may emit only two things:
+
+- `passage_idx` — which numbered passage it used
+- `quote` — a contiguous verbatim span copied from that passage
+
+It does **not** emit the paper title, the page number, or the chunk id. Those
+are looked up server-side from `passage_idx` ([`query.py`](papertrail/query.py)),
+so a citation's provenance comes from the retrieval index, never from the model.
+
+Every quote is then checked against the full text of the passage it cites
+(`_verify_quote`). Matching normalizes the things PDF extraction and language
+models genuinely disagree about — smart quotes, en/em dashes, footnote daggers
+and asterisks, non-breaking spaces, casing, whitespace — then requires either an
+exact substring match or a sliding-window similarity ≥ 0.85, which absorbs OCR
+noise without letting a paraphrase through. Quotes under 3 words are rejected as
+too weak to ground anything. **Citations that fail verification are dropped from
+the response**, not flagged and shown; they are returned separately in
+`dropped_sources` for debugging.
+
+A second pass (`_check_faithfulness`) re-reads the answer against the passages
+and flags substantive factual claims that nothing supports. The reported
+confidence is then bounded from above by that support score, so an answer cannot
+present itself as confident and unsupported at the same time.
+
+Entity extraction gets the same treatment at ingest time: extracted entities
+that do not actually appear in the source are dropped
+([`extraction.py`](papertrail/extraction.py)), with alias-aware matching so a
+model that writes "recurrent neural network" is still accepted when the paper
+says "RNN".
+
+## Evaluation
+
+Retrieval quality is measured, not asserted. [`eval_recall/`](eval_recall/) runs
+the real retrieval stack — the same `_search_chunks` the app calls, dense + BM25
++ RRF — and reports Recall@k and MRR. No LLM is involved, because recall is a
+property of retrieval rather than of answer generation.
+
+| Metric | Value |
+|---|---:|
+| Recall@1 | 77.8% |
+| Recall@5 | 100.0% |
+| Recall@10 | 100.0% |
+| MRR | 0.870 |
+
+Committed artifact: [reports/recall.md](reports/recall.md). Regenerate it with:
+
+```bash
+python -m eval_recall.recall_eval
+```
+
+The harness isolates itself in a temporary `STATE_DIR`, so running it never
+touches your real library. It takes a few seconds.
+
+**What the benchmark is.** A constructed corpus of 15 papers / 120 chunks / 45
+queries, where relevance is defined by construction rather than hand-labeled:
+each paper contains exactly one planted result passage, which is the gold chunk
+for its queries. All names are invented (`ZephyrNet`, `CartoQA`, …) so no real
+paper can leak in. Two choices keep it from being trivial — each dataset is
+shared by three papers, so a dataset name alone cannot identify the answer; and
+each paper gets three query phrasings: `explicit` (all key tokens present),
+`paraphrase` (metric dropped, reworded), and `semantic` (method name omitted
+entirely, so the retriever must disambiguate among the three papers sharing that
+dataset).
+
+**What it does and doesn't show.** These are honest numbers on an invented
+corpus: they validate the retrieval pipeline and the harness, not a claim about
+arbitrary real papers. Recall@5 saturates at 100% across all three query types,
+so **Recall@1 and MRR are the only figures carrying signal here** — a 120-chunk
+corpus is a small haystack. The harness also measures a single configuration
+(hybrid, reranker off); it does not currently ablate dense-only vs BM25-only vs
+fused, so it is not evidence that RRF beats either lane alone.
+
+To evaluate on your own papers, index them, write a JSONL of
+`{"query": ..., "gold_chunk_id": "<paper_id>_chunk_<i>"}` judgments, and see
+[`eval_recall/README.md`](eval_recall/README.md) for the current state of the
+`--labeled` path.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
@@ -115,7 +218,8 @@ panel (Upload, Knowledge Graph, Ask, Library, Sidebar) plus shared pieces.
 | POST | /query/stream | Same, as Server-Sent Events: live pipeline progress, then the result |
 | GET | /papers | List all papers |
 | GET | /papers/{paper_id} | Fetch a single paper |
-| GET | /graph | Get knowledge graph (nodes + edges) |
+| GET | /graph | Get knowledge graph (nodes + edges). `?limit=N` trims large graphs for rendering: papers/notes are always kept, then the highest-degree entities fill the budget |
+| GET | /export | Portable JSON backup: paper metadata + knowledge graph. `?include_chunks=true` adds every indexed chunk for a complete snapshot |
 | GET | /stats | System statistics |
 | DELETE | /papers/{paper_id} | Delete a single paper † |
 | DELETE | /reset | Reset everything † |
@@ -123,9 +227,46 @@ panel (Upload, Knowledge Graph, Ask, Library, Sidebar) plus shared pieces.
 † If the `ADMIN_TOKEN` env var is set, these require a matching `X-Admin-Token`
 header — recommended on public deploys.
 
-## Without an API Key
+## Without an API key
 
-The system still works without an API key — it just skips entity extraction (no graph building) and uses only vector search for queries. For the demo, you really want the API key to show the full pipeline.
+Embeddings and BM25 run locally, so **hybrid retrieval and knowledge-graph
+traversal work with no API key at all**. What a key buys is the generative half
+of the pipeline:
+
+| Stage | Needs a key |
+|---|---|
+| Chunking, embedding, hybrid retrieval (vector + BM25 + RRF) | no |
+| Knowledge-graph traversal over an existing graph | no |
+| Entity extraction at ingest (i.e. *building* the graph) | yes |
+| Answer synthesis, citation verification, faithfulness check | yes |
+
+Queries against a key-less server return `retrieval_only: true` with the ranked
+passages, their source papers, and the relevant subgraph — the evidence, just
+not the essay. Because extraction is what needs the key, a key-less server can
+*serve* a graph but cannot *build* one.
+
+## Public demo mode
+
+`DEMO_MODE=1` serves a fixed, read-only library: the snapshot at
+`$DEMO_SNAPSHOT` (default `demo/library.json`) is loaded on boot if the library
+is empty, and `/upload`, `/upload-url`, `/note`, `DELETE /papers/{id}` and
+`DELETE /reset` all return 403. That is what makes a public deployment safe to
+leave running — no credentials on it, and no way for a visitor to fill its disk
+or wipe it for everyone else.
+
+Build the snapshot once, locally, with a key:
+
+```bash
+export GROQ_API_KEY=gsk_...
+python main.py                          # one terminal
+python scripts/build_demo_library.py    # another
+```
+
+That ingests a fixed set of papers through the ordinary `/upload-url` path — so
+the graph in the snapshot is real extraction output, not authored data — then
+writes `demo/library.json` via `GET /export?include_chunks=true`. Commit it and
+deploy with `DEMO_MODE=1` and **no** API key set. The snapshot stores chunk
+text rather than vectors, so embeddings are recomputed locally on load.
 
 ## Deployment (single container)
 
@@ -137,7 +278,9 @@ backend on a single port.
 1. Create a new Space → SDK: **Docker** (the README frontmatter already declares
    this so HF will pick it up automatically).
 2. Push this repo to the Space.
-3. In the Space's **Settings → Variables and secrets**, add `GROQ_API_KEY`.
+3. In the Space's **Settings → Variables and secrets**, either add
+   `GROQ_API_KEY` for the full pipeline, or set `DEMO_MODE=1` with no key for a
+   read-only public demo (see [Public demo mode](#public-demo-mode)).
 4. Wait for the build. The app appears at `https://huggingface.co/spaces/<you>/<name>`.
 
 ### Render / Fly.io / Railway
@@ -162,8 +305,11 @@ docker run -p 7860:7860 -e GROQ_API_KEY=$GROQ_API_KEY papertrail
 
 ```bash
 pip install pytest
-pytest tests/
+pytest tests/          # application test suite
+pytest eval_recall/    # metric-math tests for the recall harness
 ```
 
 CI (GitHub Actions) runs the Python test suite plus frontend lint and build on
-every push and pull request.
+every push and pull request. Note that CI runs `pytest tests/`, and
+`pyproject.toml` sets `testpaths = ["tests"]` — so the `eval_recall/` tests are
+**not** covered by CI and have to be run explicitly, as above.

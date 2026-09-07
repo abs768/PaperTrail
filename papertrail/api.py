@@ -8,6 +8,7 @@ import pathlib
 import re
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
@@ -17,7 +18,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import state
-from .config import UPLOAD_DIR
+from .config import DEMO_MODE, DEMO_SNAPSHOT, UPLOAD_DIR, client as _llm_client
 from .extraction import extract_entities
 from .kgraph import add_to_knowledge_graph
 from .models import NoteRequest, QueryRequest, UrlUploadRequest
@@ -35,7 +36,23 @@ from .textproc import (
 
 logger = logging.getLogger("papertrail")
 
-app = FastAPI(title="PaperTrail API", version="2.0.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """In demo mode, load the bundled snapshot into an empty library on boot.
+
+    Chunk embeddings are recomputed locally on load, so this needs no API key
+    — which is the point: the public demo carries no credentials.
+    """
+    if DEMO_MODE:
+        from .seed import seed_if_empty
+        summary = seed_if_empty(DEMO_SNAPSHOT)
+        if summary:
+            logger.info("Demo library ready: %s", summary)
+    yield
+
+
+app = FastAPI(title="PaperTrail API", version="2.0.0", lifespan=_lifespan)
 
 # Wildcard origins with credentials is an invalid CORS combination (and the app
 # uses no cookies), so credentials stay off. Origins can be pinned via env.
@@ -61,6 +78,21 @@ def _check_admin(supplied: str):
         raise HTTPException(403, "Admin token required (X-Admin-Token header)")
 
 
+def _check_writable():
+    """Reject mutations in demo mode.
+
+    The public demo serves a fixed library: leaving ingestion open would let
+    anyone grow its storage without bound, and deletion open would let one
+    visitor empty it for everyone.
+    """
+    if DEMO_MODE:
+        raise HTTPException(
+            403,
+            "This is a read-only public demo. Run PaperTrail locally to add "
+            "your own papers — see the repository README.",
+        )
+
+
 # Serializes mutations of the shared state (kg / papers_db / vector collection).
 # Endpoints run in the threadpool, so two concurrent uploads or a delete during
 # an upload would otherwise interleave. The slow part of ingestion (LLM entity
@@ -70,7 +102,17 @@ _mutate_lock = threading.Lock()
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "PaperTrail API", "version": "2.0.0"}
+    """Health plus the two capability flags the UI needs to describe itself:
+    whether the library is writable, and whether LLM synthesis is available."""
+    return {
+        "status": "ok",
+        "service": "PaperTrail API",
+        "version": "2.0.0",
+        "demo_mode": DEMO_MODE,
+        "read_only": DEMO_MODE,
+        "llm_enabled": _llm_client is not None,
+        "papers": len(state.papers_db),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -174,6 +216,7 @@ def _ingest_pdf_bytes(file_bytes: bytes, source_label: str, metadata_override: d
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
+    _check_writable()
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported")
     file_bytes = await file.read()
@@ -266,6 +309,7 @@ async def _fetch_arxiv_metadata(url: str) -> dict:
 
 @app.post("/upload-url")
 async def upload_pdf_from_url(req: UrlUploadRequest):
+    _check_writable()
     import httpx
     url = _normalize_paper_url(req.url)
     _assert_public_http_url(url)
@@ -311,6 +355,7 @@ def _ingest_note(title: str, content: str) -> dict:
 
 @app.post("/note")
 async def add_note(note: NoteRequest):
+    _check_writable()
     return await run_in_threadpool(_ingest_note, note.title, note.content)
 
 
@@ -479,6 +524,7 @@ def get_stats():
 
 @app.delete("/papers/{paper_id:path}")
 def delete_paper(paper_id: str, x_admin_token: str = Header(default="")):
+    _check_writable()
     _check_admin(x_admin_token)
     paper_id = paper_id.replace("%3A", ":")
     with _mutate_lock:
@@ -517,6 +563,7 @@ def delete_paper(paper_id: str, x_admin_token: str = Header(default="")):
 
 @app.delete("/reset")
 def reset_system(x_admin_token: str = Header(default="")):
+    _check_writable()
     _check_admin(x_admin_token)
     with _mutate_lock:
         state.reset()
@@ -530,13 +577,26 @@ def reset_system(x_admin_token: str = Header(default="")):
 
 
 # ── Serve built frontend (single-container deploy) ────────────────────────────
-_FRONTEND_DIST = pathlib.Path(__file__).parent.parent / "frontend" / "dist"
+_FRONTEND_DIST = (pathlib.Path(__file__).parent.parent / "frontend" / "dist").resolve()
 if _FRONTEND_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
 
+    def _safe_dist_file(full_path: str):
+        """Resolve `full_path` under the dist root, or None if it would escape.
+
+        `full_path` is attacker-controlled and may contain traversal sequences
+        (including percent-encoded ones like %2e%2e%2f that survive URL
+        normalization). Resolving the joined path and confirming it stays within
+        _FRONTEND_DIST is what stops it from serving .env, source, or /etc/passwd.
+        """
+        candidate = (_FRONTEND_DIST / full_path).resolve()
+        if candidate != _FRONTEND_DIST and _FRONTEND_DIST not in candidate.parents:
+            return None
+        return candidate if candidate.is_file() else None
+
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa_fallback(full_path: str):
-        candidate = _FRONTEND_DIST / full_path
-        if candidate.is_file():
+        candidate = _safe_dist_file(full_path)
+        if candidate is not None:
             return FileResponse(candidate)
         return FileResponse(_FRONTEND_DIST / "index.html")
