@@ -51,7 +51,7 @@ DEMO_SNAPSHOT = os.getenv("DEMO_SNAPSHOT", "demo/library.json")
 
 if _GROQ_KEY:
     client = OpenAI(api_key=_GROQ_KEY, base_url="https://api.groq.com/openai/v1")
-    _DEFAULT_MODEL = "llama-3.3-70b-versatile"
+    _DEFAULT_MODEL = "openai/gpt-oss-120b"
 elif _GEMINI_KEY:
     client = OpenAI(api_key=_GEMINI_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
     _DEFAULT_MODEL = "gemini-2.5-flash"

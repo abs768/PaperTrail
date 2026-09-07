@@ -49,8 +49,8 @@ pip install -r requirements.txt
 
 # Set your Groq API key (or GEMINI_API_KEY as fallback)
 export GROQ_API_KEY="gsk_your-key-here"
-# Optional: pick a different Groq model
-# export GROQ_MODEL="llama-3.1-8b-instant"
+# Optional: pick a different Groq model (default: openai/gpt-oss-120b)
+# export GROQ_MODEL="openai/gpt-oss-20b"
 
 # Run the server
 python main.py
@@ -95,13 +95,13 @@ Vite will serve at `http://localhost:5173` and talk to the backend at `:8000`.
 
 ```
 PDF Upload → Text Extraction (PyMuPDF)
-           → Entity Extraction (Groq llama-3.3-70b)
+           → Entity Extraction (Groq gpt-oss-120b)
            → Knowledge Graph (NetworkX)
            → Vector Embeddings (ChromaDB)
 
 Query → Vector Search (ChromaDB) + BM25 → Reciprocal Rank Fusion
       → Graph Traversal (NetworkX)
-      → Answer Generation (Groq llama-3.3-70b)
+      → Answer Generation (Groq gpt-oss-120b)
       → Citation Verification + Faithfulness Check
       → Cited Response
 ```
