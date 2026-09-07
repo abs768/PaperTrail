@@ -160,6 +160,142 @@ that do not actually appear in the source are dropped
 model that writes "recurrent neural network" is still accepted when the paper
 says "RNN".
 
+## Design decisions
+
+What the code actually does, and where a choice is visible in it. Where the
+code makes a choice without recording a reason, this says so rather than
+inventing one.
+
+### Embedding model — all-MiniLM-L6-v2, 384 dimensions
+
+`state.py` builds the collection with ChromaDB's bundled
+`DefaultEmbeddingFunction()`. In the pinned `chromadb==1.5.9` that resolves to
+`ONNXMiniLM_L6_V2`, whose `MODEL_NAME` is `all-MiniLM-L6-v2`, executed through
+`onnxruntime` rather than PyTorch. The model is fetched once to
+`~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/`.
+
+Vectors are **384-dimensional**. The code never states this, so it was measured
+two ways: embedding a probe string returns a length-384 vector, and reading a
+stored vector back out of the 401-chunk demo library gives the same. The
+collection is created with `metadata={"hnsw:space": "cosine"}`, so similarity is
+cosine.
+
+**Why this model:** the code records no comparison against other embedding
+models, and none should be inferred. What it does depend on is that this one
+runs **locally with no API key** — `config.py`'s demo-mode comment and
+`seed.py`'s docstring both rest on it, and it is what allows retrieval and the
+public demo to work with no credentials. That is a property the design relies
+on, not a benchmarked preference.
+
+### Chunking — 400 words, 80-word overlap, page-aligned
+
+Both parameters are env-tunable (`CHUNK_TARGET_WORDS`, `CHUNK_OVERLAP_WORDS`)
+and live in `textproc.py`. The packing is structure-aware, in three tiers:
+
+1. Split on blank lines into paragraphs and greedily pack them to the target.
+2. A single paragraph over target is split into sentences and re-packed.
+3. A unit that will not split — one runaway sentence, garbled OCR — falls back
+   to a hard word window with stride `target - overlap`.
+
+Overlap is applied by carrying the last `overlap_words` of the previous chunk
+onto the front of the next, so a sentence straddling a boundary is findable from
+either side.
+
+PDFs are chunked **per page** (`chunk_pages`), which is what lets every chunk
+carry a single page number — that page is what a verified citation reports, and
+it is read from the chunk rather than from the model. Notes go through
+`chunk_text` and have no page numbers.
+
+Entity extraction uses a **separate, larger geometry** measured in characters,
+not words: `EXTRACTION_CHUNK_CHARS` (8000), `EXTRACTION_OVERLAP_CHARS` (600),
+`EXTRACTION_MAX_CHUNKS` (3). It always keeps the head and the tail of the paper
+and fills the middle up to the budget. Retrieval chunking and extraction
+slicing are independent.
+
+### ChromaDB — the comparison is not in the code
+
+**The code contains no justification for ChromaDB over Qdrant, FAISS, or
+pgvector.** No alternative store is named anywhere in the repository, and no
+comment or commit explains the choice, so this section cannot state one.
+
+What is determinable is the surface the code actually uses, which is what a
+replacement would have to provide:
+
+- a persistent local client pointed at a directory (`PersistentClient` under
+  `STATE_DIR/chroma`) — no server process is run or configured anywhere
+- a **bundled embedding function**, so no separate embedding service exists in
+  the system
+- metadata filtering with `where={"paper_id": {"$in": [...]}}`, used to retrieve
+  a balanced top-N per paper on comparative queries
+- bulk read-back via `.get(include=["documents", "metadatas"])`, which the BM25
+  index is rebuilt from and which `GET /export` serialises
+- delete-by-filter (`collection.delete(where={"paper_id": ...})`)
+
+### RRF — rank-based fusion, K=60
+
+`_search_chunks` runs the vector and BM25 lanes separately, then fuses with
+Reciprocal Rank Fusion: each lane contributes `1 / (K + rank + 1)` per chunk and
+the scores are summed. `K_RRF = 60`, which the code attributes to the original
+RRF paper (Cormack et al.) with the stated effect of damping top-rank dominance.
+
+The mechanically relevant property, visible in the formula: the fused score is
+computed **only from rank positions** — the lanes' raw scores, cosine distance
+and BM25 relevance, never enter it. Each lane is queried for a wider pool than
+requested (`max(top_k * 3, 20)`, widening to `* 6` when the reranker is on) so
+there is material to fuse over, and a chunk found by only one lane is hydrated
+and kept rather than dropped.
+
+Worth reading alongside [Evaluation](#evaluation): on the bundled benchmark this
+fusion does **not** outperform either lane alone.
+
+### The faithfulness check — entailment, distinct from quote verification
+
+There are two separate mechanisms and they verify different things.
+
+`_verify_quote` is deterministic and lexical: it confirms a citation's quote
+appears verbatim in the passage it cites, and **drops the citation** if not.
+
+The faithfulness check (`_check_faithfulness`) is a second LLM pass on
+`MODEL_FAST` that receives the question, the retrieved passages, the knowledge
+graph subgraph, and the generated answer. It returns:
+
+- `unsupported_claims` — substantive factual claims quoted verbatim from the
+  answer that no passage or subgraph triple supports
+- `support_score` — supported substantive claims ÷ total substantive claims
+
+Its prompt defines "substantive" narrowly: results and numbers, who proposed or
+authored what, method-uses/outperforms/extends relations, dataset mentions, and
+cross-paper comparisons. It is told **not** to flag meta-statements, hedges,
+generic definitions, or restatements of the question. It judges entailment, not
+wording — "lexical paraphrase is OK; logical leaps are NOT" — which is precisely
+what distinguishes it from the verbatim quote check.
+
+The result only ever lowers confidence, never raises it: confidence is capped at
+`support_score`, capped again at `max(0.1, 1 - 0.15 × unsupported)` when claims
+are flagged, and capped at 0.4 if at least half the emitted citations failed
+quote verification. If the check itself errors it returns `None` and the query
+still succeeds — the signal is lost, not the answer. If nothing was retrieved,
+`support_score` is 0.0.
+
+### Groq model — openai/gpt-oss-120b
+
+`config.py` sets `_DEFAULT_MODEL = "openai/gpt-oss-120b"` when `GROQ_API_KEY` is
+present, reached through Groq's OpenAI-compatible endpoint. With only
+`GEMINI_API_KEY` set it is `gemini-2.5-flash`; with neither, the client is
+`None` and the app runs retrieval-only.
+
+Two lanes are defined — `MODEL_FAST` for classification, entity extraction and
+the faithfulness check, `MODEL_QUALITY` for answer synthesis. **Both default to
+the same model**, so the split has no effect until `LLM_MODEL_FAST` /
+`LLM_MODEL_QUALITY` are set; precedence is per-lane var, then `GROQ_MODEL`, then
+the default.
+
+Every structured call goes through `_parse_structured`, which prepends the
+Pydantic model's JSON Schema as a system primer and requests
+`response_format={"type": "json_object"}`. If that fails for any reason other
+than a rate limit, it retries without the format constraint and salvages the
+largest balanced `{...}` from the response.
+
 ## Evaluation
 
 Retrieval quality is measured, not asserted. [`eval_recall/`](eval_recall/) runs
