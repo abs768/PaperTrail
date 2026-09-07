@@ -149,7 +149,7 @@ def _ingest_pdf_bytes(file_bytes: bytes, source_label: str, metadata_override: d
 
     # Title resolution priority:
     #   LLM-extracted (if grounded) > PDF metadata > first-page font-size heuristic > URL filename.
-    # The grounding check guards against the 8B model paraphrasing the title
+    # The grounding check guards against the model paraphrasing the title
     # (e.g. emitting 'Transfer Learning for NLP via BERT' instead of the actual
     # 'BERT: Pre-training of Deep Bidirectional Transformers...'). If the
     # LLM-emitted title doesn't appear verbatim near the start of the source,

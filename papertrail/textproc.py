@@ -50,9 +50,9 @@ def extract_pdf_metadata_title(file_path: str) -> str:
 def _llm_title_is_grounded(title: str, full_text: str) -> bool:
     """Return True if the LLM-extracted title actually appears in the source.
 
-    The 8B model sometimes paraphrases the title (e.g. emits 'Transfer Learning
-    for NLP via BERT' for the BERT paper, whose real title is 'BERT:
-    Pre-training of Deep Bidirectional Transformers for Language
+    Smaller/faster models paraphrase the title rather than copying it (e.g.
+    emitting 'Transfer Learning for NLP via BERT' for the BERT paper, whose real
+    title is 'BERT: Pre-training of Deep Bidirectional Transformers for Language
     Understanding'). Verbatim substring match in the head of the document is a
     cheap, reliable check — if the LLM extracted what's actually written, the
     string will be there. Trailing punctuation differences (':', '.', ',') are
@@ -213,9 +213,10 @@ def _strip_references_section(text: str) -> str:
     """Truncate the paper at the start of its References / Bibliography section.
 
     Citations leak into entity extraction otherwise: reference paper titles get
-    tagged as 'methods' and citation author lists get tagged as 'authors'. The
-    8B model is especially prone to this. Stripping references before slicing
-    keeps the extraction focused on the paper's own contributions.
+    tagged as 'methods' and citation author lists get tagged as 'authors'.
+    Smaller/faster models are especially prone to this. Stripping references
+    before slicing keeps the extraction focused on the paper's own
+    contributions.
 
     The references heading is searched only in the latter half of the document
     so an incidental in-prose mention of the word 'references' earlier doesn't
