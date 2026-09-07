@@ -26,8 +26,9 @@ shown.
   number and a verbatim quote; the paper title and page are filled in
   server-side. Unverifiable citations never reach the UI.
   → [How grounding works](#grounded-citations)
-- **Measured retrieval, not asserted.** Recall@1 77.8%, Recall@5 100%, MRR 0.870
-  on a controlled benchmark, reproducible in one command.
+- **Measured retrieval, not asserted.** Recall@1 77.8%, MRR 0.870 on a controlled
+  benchmark, ablated across four retrieval configurations — including the finding
+  that fusion and reranking buy nothing measurable on it.
   → [Evaluation](#evaluation)
 - **Hybrid retrieval.** ChromaDB dense vectors + BM25, fused with Reciprocal
   Rank Fusion, with an optional cross-encoder rerank stage.
@@ -162,22 +163,52 @@ says "RNN".
 ## Evaluation
 
 Retrieval quality is measured, not asserted. [`eval_recall/`](eval_recall/) runs
-the real retrieval stack — the same `_search_chunks` the app calls, dense + BM25
-+ RRF — and reports Recall@k and MRR. No LLM is involved, because recall is a
-property of retrieval rather than of answer generation.
+the real retrieval stack and ablates it across four configurations, reporting
+Recall@k, MRR, and median latency. No LLM is involved, because recall is a
+property of retrieval rather than of answer generation. Each lane is the
+application's own code isolated — `dense` is `_vector_search_raw`, `bm25` is
+`_bm25_search`, `hybrid` is the `_search_chunks` the app actually calls, and
+`hybrid+rerank` is that under `ENABLE_RERANKER=1`.
 
-| Metric | Value |
-|---|---:|
-| Recall@1 | 77.8% |
-| Recall@5 | 100.0% |
-| Recall@10 | 100.0% |
-| MRR | 0.870 |
+| Configuration | Recall@1 | Recall@5 | Recall@10 | MRR | Median latency † |
+|---|---:|---:|---:|---:|---:|
+| dense (Chroma only) | 77.8% | 100.0% | 100.0% | 0.869 | 66 ms |
+| BM25 only | 77.8% | 100.0% | 100.0% | 0.870 | 0.3 ms |
+| hybrid (RRF fusion) | 77.8% | 100.0% | 100.0% | 0.870 | 67 ms |
+| hybrid + cross-encoder rerank | 77.8% | 100.0% | 100.0% | 0.870 | 165 ms |
+
+**What this shows: on this corpus, RRF fusion does not beat either lane alone —
+every configuration returns identical Recall@1 and MRR within 0.001, so the
+fusion is buying no measurable accuracy over plain BM25, which is ~200× cheaper.
+The cross-encoder likewise earns nothing here: it triples median latency for
+zero movement on any quality metric, so on this evidence its ~2 GB of
+dependencies are not justified.** The honest reading is that the benchmark is
+too easy to separate them rather than that the lanes are truly equivalent — a
+120-chunk corpus with one planted answer per paper is a small haystack, and a
+result this flat is a finding about the corpus as much as about the retriever.
+Anyone choosing a configuration on this basis should build a harder labeled set
+first; what the ablation establishes is that the harness exercises the real code
+paths and that the current default is not demonstrably better than the cheapest
+option.
+
+† Latency is machine-dependent and is **not** in the committed artifact, which
+is byte-stable by design; these figures come from a local run and are printed by
+every run. Measured spread over four back-to-back runs: 0.01 ms (BM25),
+0.09–0.17 ms (dense/hybrid), 6.8 ms (cross-encoder).
 
 Committed artifact: [reports/recall.md](reports/recall.md). Regenerate it with:
 
 ```bash
-python -m eval_recall.recall_eval
+python -m eval_recall.recall_eval                 # all four configs
+python -m eval_recall.recall_eval --config bm25   # one lane
+python -m eval_recall.recall_eval --with-latency  # include latency in the file
 ```
+
+`hybrid+rerank` needs `pip install -r requirements-reranker.txt`. Without it the
+row is left blank with a stated reason rather than filled in — the harness
+verifies the cross-encoder actually loaded, because `_rerank_chunks` falls back
+to fused order on failure and would otherwise republish hybrid's numbers under a
+rerank label.
 
 The harness isolates itself in a temporary `STATE_DIR`, so running it never
 touches your real library. It takes a few seconds.
@@ -195,11 +226,13 @@ dataset).
 
 **What it does and doesn't show.** These are honest numbers on an invented
 corpus: they validate the retrieval pipeline and the harness, not a claim about
-arbitrary real papers. Recall@5 saturates at 100% across all three query types,
-so **Recall@1 and MRR are the only figures carrying signal here** — a 120-chunk
-corpus is a small haystack. The harness also measures a single configuration
-(hybrid, reranker off); it does not currently ablate dense-only vs BM25-only vs
-fused, so it is not evidence that RRF beats either lane alone.
+arbitrary real papers. Recall@5 saturates at 100% across all three query types
+*and* all four configurations, and Recall@1 is flat at 77.8% everywhere — so on
+this corpus no quality metric separates the lanes at all, and latency is the only
+column that discriminates. A 120-chunk corpus with one planted answer per paper
+is simply too small to rank retrieval strategies. Treat the flat result as a
+limit of the benchmark, and build a harder labeled set before using it to pick a
+configuration.
 
 To evaluate on your own papers, index them, write a JSONL of
 `{"query": ..., "gold_chunk_id": "<paper_id>_chunk_<i>"}` judgments, and see
