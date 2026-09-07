@@ -21,5 +21,9 @@ packages = ["papertrail"]
 dependencies = { file = "requirements.txt" }
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Both suites: `tests` covers the application, `eval_recall` covers the
+# retrieval-evaluation harness (metric math and lane isolation, all mocked — no
+# embedding model or reranker needed). Note testpaths only applies when pytest is
+# given no path argument, so CI runs a bare `pytest` to let this govern.
+testpaths = ["tests", "eval_recall"]
 addopts = "-q"

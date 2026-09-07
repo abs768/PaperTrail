@@ -27,8 +27,11 @@ jobs:
       - name: Build frontend (so SPA traversal tests run instead of skipping)
         working-directory: frontend
         run: npm ci && npm run build
+      # Bare `pytest` on purpose: an explicit path argument overrides testpaths,
+      # so `pytest tests/` would silently keep skipping eval_recall/. Letting
+      # pyproject's testpaths govern keeps the suite list in one place.
       - name: Run tests
-        run: pytest tests/ -q
+        run: pytest -q
 
   frontend:
     runs-on: ubuntu-latest
