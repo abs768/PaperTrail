@@ -229,21 +229,44 @@ header — recommended on public deploys.
 
 ## Without an API key
 
-Embeddings and BM25 both run locally, so **hybrid retrieval works with no API
-key at all**. What a key buys is the generative half of the pipeline:
+Embeddings and BM25 run locally, so **hybrid retrieval and knowledge-graph
+traversal work with no API key at all**. What a key buys is the generative half
+of the pipeline:
 
 | Stage | Needs a key |
 |---|---|
 | Chunking, embedding, hybrid retrieval (vector + BM25 + RRF) | no |
 | Knowledge-graph traversal over an existing graph | no |
-| Entity extraction at ingest — i.e. *building* the graph | yes |
+| Entity extraction at ingest (i.e. *building* the graph) | yes |
 | Answer synthesis, citation verification, faithfulness check | yes |
 
-A key-less server answers queries with the ranked passages and their source
-papers rather than a synthesized essay. Note the asymmetry: because extraction
-is the step that needs a key, a key-less server can *serve* a knowledge graph
-but cannot *build* one — papers ingested without a key produce no entities. To
-show the full pipeline, set a key.
+Queries against a key-less server return `retrieval_only: true` with the ranked
+passages, their source papers, and the relevant subgraph — the evidence, just
+not the essay. Because extraction is what needs the key, a key-less server can
+*serve* a graph but cannot *build* one.
+
+## Public demo mode
+
+`DEMO_MODE=1` serves a fixed, read-only library: the snapshot at
+`$DEMO_SNAPSHOT` (default `demo/library.json`) is loaded on boot if the library
+is empty, and `/upload`, `/upload-url`, `/note`, `DELETE /papers/{id}` and
+`DELETE /reset` all return 403. That is what makes a public deployment safe to
+leave running — no credentials on it, and no way for a visitor to fill its disk
+or wipe it for everyone else.
+
+Build the snapshot once, locally, with a key:
+
+```bash
+export GROQ_API_KEY=gsk_...
+python main.py                          # one terminal
+python scripts/build_demo_library.py    # another
+```
+
+That ingests a fixed set of papers through the ordinary `/upload-url` path — so
+the graph in the snapshot is real extraction output, not authored data — then
+writes `demo/library.json` via `GET /export?include_chunks=true`. Commit it and
+deploy with `DEMO_MODE=1` and **no** API key set. The snapshot stores chunk
+text rather than vectors, so embeddings are recomputed locally on load.
 
 ## Deployment (single container)
 
@@ -255,7 +278,9 @@ backend on a single port.
 1. Create a new Space → SDK: **Docker** (the README frontmatter already declares
    this so HF will pick it up automatically).
 2. Push this repo to the Space.
-3. In the Space's **Settings → Variables and secrets**, add `GROQ_API_KEY`.
+3. In the Space's **Settings → Variables and secrets**, either add
+   `GROQ_API_KEY` for the full pipeline, or set `DEMO_MODE=1` with no key for a
+   read-only public demo (see [Public demo mode](#public-demo-mode)).
 4. Wait for the build. The app appears at `https://huggingface.co/spaces/<you>/<name>`.
 
 ### Render / Fly.io / Railway
