@@ -21,6 +21,8 @@ frontend/.gitignore
 frontend/README.md
 
 # recall eval
-eval_recall/reports/
+# `python -m eval_recall.recall_eval` writes reports/recall.md relative to the
+# working directory, so the committed artifact lives at reports/ — it is checked
+# in on purpose (see README "Evaluation") and must NOT be ignored.
 .venv/
 **/__pycache__/
